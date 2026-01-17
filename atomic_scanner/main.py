@@ -13,31 +13,27 @@ def main():
     logging.info("Starting atomic scanner...")
 
     # --- Configuration ---
-    # For read-only access, API credentials are not required.
-    # For trading, you would need to provide your private key, API key, and API secret.
-    
-    # Mainnet configuration
     host = "https://clob.polymarket.com"
-    chain_id = 137 
+    chain_id = 137 # Polygon Mainnet
 
     # --- Client Initialization ---
     try:
+        # Initializing for read-only access as per requirements
         client = ClobClient(host, chain_id=chain_id, creds=None)
         logging.info("Successfully connected to the CLOB API.")
     except Exception as e:
         logging.error(f"Failed to connect to the CLOB API: {e}")
         return
 
-    # Arbitrage threshold
-    threshold = Decimal('0.01')
+    # Arbitrage threshold defined in project context
+    threshold = Decimal('0.01') 
     logging.info(f"Arbitrage threshold set to: {threshold}")
 
-    # --- Market Monitoring Loop ---
     try:
         while True:
             logging.info("Fetching active markets...")
-            
             try:
+                # Fetches first page of active markets
                 active_markets = client.get_markets()
                 
                 if not active_markets or not active_markets.get('data'):
@@ -48,43 +44,50 @@ def main():
                 logging.info(f"Found {len(active_markets['data'])} active markets.")
                 
                 for market in active_markets['data']:
+                    # Ensure the market is active and has exactly two tokens (binary)
                     if market.get('accepting_orders') and len(market.get('tokens', [])) == 2:
-                        condition_id = market.get('condition_id')
                         tokens = market.get('tokens')
-                        token0_id = tokens[0].get('token_id')
-                        token1_id = tokens[1].get('token_id')
+                        
+                        # FIX: Use 'clobTokenId' instead of 'token_id'
+                        token0_id = tokens[0].get('clobTokenId')
+                        token1_id = tokens[1].get('clobTokenId')
+
+                        # Skip markets that are not supported on the CLOB
+                        if not token0_id or not token1_id:
+                            continue
 
                         try:
-                            # Get order book for both tokens
-                            orderbook0 = client.get_orderbook(f"{condition_id}-{token0_id}")
-                            orderbook1 = client.get_orderbook(f"{condition_id}-{token1_id}")
+                            # The get_order_book method now uses the correct CLOB-specific ID
+                            orderbook0 = client.get_order_book(token0_id)
+                            orderbook1 = client.get_order_book(token1_id)
+                            
+                            # Extract best ask prices to calculate total cost
+                            # Using .get('asks') assumes dict-style response; check library version if issues persist
+                            asks0 = orderbook0.get('asks', []) if isinstance(orderbook0, dict) else orderbook0.asks
+                            asks1 = orderbook1.get('asks', []) if isinstance(orderbook1, dict) else orderbook1.asks
 
-                            # Find the best ask price for each token
-                            best_ask_0 = min([Decimal(ask['price']) for ask in orderbook0.get('asks', [])], default=None)
-                            best_ask_1 = min([Decimal(ask['price']) for ask in orderbook1.get('asks', [])], default=None)
+                            best_ask_0 = min([Decimal(ask['price']) for ask in asks0], default=None)
+                            best_ask_1 = min([Decimal(ask['price']) for ask in asks1], default=None)
 
                             if best_ask_0 is not None and best_ask_1 is not None:
                                 price_sum = best_ask_0 + best_ask_1
+                                
+                                # Logic: P(Yes) + P(No) < (1.0 - threshold)
                                 if price_sum < (Decimal('1.0') - threshold):
-                                    logging.warning(f"Arbitrage opportunity found in market: {market.get('question')}")
-                                    logging.warning(f"  Condition ID: {condition_id}")
-                                    logging.warning(f"  Token 0 ({tokens[0].get('outcome')}): Best Ask = {best_ask_0}")
-                                    logging.warning(f"  Token 1 ({tokens[1].get('outcome')}): Best Ask = {best_ask_1}")
-                                    logging.warning(f"  Sum of prices: {price_sum}")
+                                    logging.warning(f"ARBITRAGE FOUND: {market.get('question')}")
+                                    logging.warning(f"  {tokens[0].get('outcome')}: {best_ask_0} | {tokens[1].get('outcome')}: {best_ask_1}")
+                                    logging.warning(f"  Total Cost: {price_sum} | Expected Profit: {Decimal('1.0') - price_sum}")
 
                         except (InvalidOperation, Exception) as e:
-                            logging.error(f"Error processing market {market.get('question')}: {e}")
+                            logging.debug(f"Could not process market {market.get('question')}: {e}")
 
             except Exception as e:
-                logging.error(f"An error occurred while fetching or processing markets: {e}")
+                logging.error(f"Error in polling cycle: {e}")
 
-            logging.info("Scanner finished a cycle. Waiting for 10 seconds before next poll...")
-            time.sleep(10)
+            time.sleep(10) # Wait for next poll
 
     except KeyboardInterrupt:
         logging.info("Scanner stopped by user.")
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
 
 if __name__ == "__main__":
     main()
