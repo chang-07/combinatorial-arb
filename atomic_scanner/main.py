@@ -6,8 +6,8 @@ import json
 import asyncio
 from decimal import Decimal, InvalidOperation
 import requests
-import websocket
-import threading
+import websockets
+import aiofiles
 from py_clob_client.client import ClobClient
 from inference_core import InferenceCore
 from dotenv import load_dotenv
@@ -27,11 +27,27 @@ API_KEY = os.environ.get("POLYMARKET_API_KEY")
 API_SECRET = os.environ.get("POLYMARKET_API_SECRET")
 API_PASSPHRASE = os.environ.get("POLYMARKET_API_PASSPHRASE")
 OPPORTUNITIES_LOG_FILE = "missed_opportunities.json"
+EVENTS_LOG_FILE = "market_events.json"
 TARGET_SIZE_USD = Decimal('500.0')
 EXCHANGE_FEE_PERCENT = Decimal('0.001')  # 0.1%
-MIN_VOLUME_THRESHOLD = Decimal('1000.0')
+MIN_VOLUME_THRESHOLD = Decimal('1.0')
 CACHE_FILE = "market_cache.json"
 CACHE_TTL = 3600  # 1 hour
+
+class AsyncLogger:
+    def __init__(self, filename):
+        self.filename = filename
+        self.queue = asyncio.Queue()
+
+    async def log(self, data):
+        await self.queue.put(data)
+
+    async def run_worker(self):
+        while True:
+            data = await self.queue.get()
+            async with aiofiles.open(self.filename, mode='a') as f:
+                await f.write(json.dumps(data) + '\n')
+            self.queue.task_done()
 
 class MarketManager:
     def __init__(self, client: ClobClient, inference_core: InferenceCore):
@@ -42,180 +58,96 @@ class MarketManager:
         self.debounce_period = 0.5  # 500ms
         self.gas_price_gwei = None
         self.total_gas_cost_usd = None
-        self.ws_app = None
-        self.ws_thread = None
-        self.reconnect_interval = 5  # Initial reconnect interval in seconds
-        self.reconnect_attempts = 0
-        self.max_reconnect_interval = 60  # Maximum reconnect interval
-        self.gas_refreshes = 0
+        self.event_logger = AsyncLogger(EVENTS_LOG_FILE)
+        self.opp_logger = AsyncLogger(OPPORTUNITIES_LOG_FILE)
         self.market_ids_to_subscribe = []
+        self.gas_refreshes = 0
 
     def discover_markets(self):
         """
-        Paginates with volume-based pruning and cache checks.
+        Replaces CLOB pagination with Gamma API discovery to find active tokens.
+        Fixes the '0 event matches' and '400 Bad Request' cursor errors.
         """
-        # 1. Check for valid cache
-        if os.path.exists(CACHE_FILE):
-            if time.time() - os.path.getmtime(CACHE_FILE) < CACHE_TTL:
-                with open(CACHE_FILE, 'r') as f:
-                    cache = json.load(f)
-                    self.market_ids_to_subscribe = cache['ids']
-                    self.order_books = cache['books']
-                    logging.info(f"Loaded {len(self.market_ids_to_subscribe)} tokens from cache.")
-                    return
-
-        logging.info("Starting fresh market discovery with volume pruning...")
-        next_cursor = ""
-        total_seen = 0
+        logging.info("Starting market discovery via Gamma API...")
         
-        while True:
-            try:
-                response = self.client.get_markets(next_cursor=next_cursor)
-            except Exception as e:
-                if "400" in str(e):
-                    logging.info("Market discovery complete: Reached end of market list.")
-                else:
-                    logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
-                break
-
-            if not response or not response.get('data'):
-                break
-
-            markets_in_page = response['data']
-            total_seen += len(markets_in_page)
-
-            for market in markets_in_page:
-                is_closed = market.get('closed', False)
-                tokens = market.get('tokens', [])
-                volume_24h = Decimal(str(market.get('volume_24h', 0)))
-                
-                if not is_closed and len(tokens) == 2 and volume_24h >= MIN_VOLUME_THRESHOLD:
-                    t0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
-                    t1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
-                    
-                    if t0_id and t1_id:
-                        self.market_ids_to_subscribe.append(t0_id)
-                        self.market_ids_to_subscribe.append(t1_id)
-                        # Link tokens directly to avoid metadata lookups in the Hot Path
-                        self.order_books[t0_id] = {"bids": [], "asks": [], "other_side": t1_id, "is_yes": True, "question": market.get("question")}
-                        self.order_books[t1_id] = {"bids": [], "asks": [], "other_side": t0_id, "is_yes": False, "question": market.get("question")}
-
-            next_cursor = response.get('next_cursor')
-            if not next_cursor or next_cursor.lower() == "none":
-                logging.info("Finished fetching all market pages.")
-                break
+        # Gamma API allows filtering for active/open markets directly
+        # 'closed=false' ensures we only get currently trading markets
+        url = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=100"
         
-        self.market_ids_to_subscribe = list(set(self.market_ids_to_subscribe))
-        
-        # 2. After loop finishes, save to cache
-        cache_data = {
-            "ids": self.market_ids_to_subscribe,
-            "books": self.order_books
-        }
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(cache_data, f)
-        logging.info(f"Discovery complete. Cached {len(self.market_ids_to_subscribe)} active tokens.")
-
-    def start(self):
-        """
-        Starts the WebSocket connection thread.
-        """
-        logging.info("MarketManager: Starting WebSocket thread...")
-        self.ws_thread = threading.Thread(target=self.run_websocket)
-        self.ws_thread.daemon = True
-        self.ws_thread.start()
-        logging.info("MarketManager: WebSocket thread started.")
-
-
-    def run_websocket(self):
-        logging.info("MarketManager: run_websocket method executing in new thread.")
-        if not API_KEY or not API_SECRET or not API_PASSPHRASE:
-            logging.warning("Polymarket API keys not found. Running in Read-Only/Public Mode.")
-        
-        furl = WEBSOCKET_URL + "/ws/market"
-        
-        while True:
-            self.ws_app = websocket.WebSocketApp(
-                furl,
-                on_open=self.on_open,
-                on_message=self.on_message,
-                on_error=self.on_error,
-                on_close=self.on_close
-            )
-            try:
-                self.ws_app.run_forever(
-                    ping_interval=30, 
-                    ping_timeout=10, 
-                    sslopt={"cert_reqs": ssl.CERT_NONE}
-                )
-            except Exception as e:
-                logging.error(f"WebSocket run_forever() failed with exception: {e}")
-
-            # Exponential backoff
-            self.reconnect_attempts += 1
-            wait_time = min(self.reconnect_interval * (2 ** self.reconnect_attempts), self.max_reconnect_interval)
-            logging.info(f"WebSocket connection lost. Attempting to reconnect in {wait_time} seconds...")
-            time.sleep(wait_time)
-
-    def on_open(self, ws):
-        logging.info("WebSocket connection opened.")
-        self.reconnect_attempts = 0
-
-        if not self.market_ids_to_subscribe:
-            logging.warning("No markets to subscribe to were found during discovery phase.")
-            return
-
-        # Batch subscription requests
-        chunk_size = 500
-        delay_between_batches = 0.1
-        total_tokens = len(self.market_ids_to_subscribe)
-        
-        logging.info(f"Subscribing to {total_tokens} tokens in batches...")
-        for i in range(0, total_tokens, chunk_size):
-            batch = self.market_ids_to_subscribe[i:i + chunk_size]
-            subscription_message = {
-                "type": "market",
-                "assets_ids": batch,
-            }
-            ws.send(json.dumps(subscription_message))
-            if total_tokens > chunk_size:
-                time.sleep(delay_between_batches)
-        
-        logging.info("Finished sending all subscription requests.")
-
-    def on_message(self, ws, message):
-        if not message:
-            return # Ignore empty keep-alive frames
-            
         try:
-            data_payload = json.loads(message)
-        except json.JSONDecodeError:
-            return # Guard against non-JSON data
+            response = requests.get(url)
+            response.raise_for_status()
+            events = response.json()
+            
+            discovered_tokens = []
+            for event in events:
+                # Each event contains a 'markets' list with the actual tradable instruments
+                for market in event.get('markets', []):
+                    ids_str = market.get('clobTokenIds')
+                    if ids_str:
+                        # clobTokenIds is returned as a stringified list by Gamma API
+                        try:
+                            token_ids = json.loads(ids_str)
+                            if isinstance(token_ids, list) and len(token_ids) == 2:
+                                discovered_tokens.extend(token_ids)
+                                t0_id = token_ids[0]
+                                t1_id = token_ids[1]
+                                self.order_books[t0_id] = {"bids": [], "asks": [], "other_side": t1_id, "is_yes": True, "question": event.get("question")}
+                                self.order_books[t1_id] = {"bids": [], "asks": [], "other_side": t0_id, "is_yes": False, "question": event.get("question")}
+                        except (json.JSONDecodeError, TypeError) as e:
+                            logging.debug(f"Failed to parse token IDs: {ids_str}")
+                            continue
+            
+            # Deduplicate the list to avoid redundant WebSocket subscriptions
+            self.market_ids_to_subscribe = list(set(discovered_tokens))
+            logging.info(f"Discovery complete. Found {len(self.market_ids_to_subscribe)} active tokens.")
+            
+            if not self.market_ids_to_subscribe:
+                logging.warning("No active markets found. Verify your IP is not geo-blocked.")
+                
+        except Exception as e:
+            logging.error(f"Discovery failed: {e}")
 
-        # Polymarket often sends batches as lists; wrap single dicts to normalize
+    async def run_websocket(self):
+        uri = f"{WEBSOCKET_URL}/ws/market"
+        async for websocket in websockets.connect(uri):
+            try:
+                # 1. Subscribe
+                subscription_message = {
+                    "type": "market",
+                    "assets_ids": self.market_ids_to_subscribe,
+                }
+                await websocket.send(json.dumps(subscription_message))
+                
+                # 2. Consume Messages
+                async for message in websocket:
+                    await self.handle_message(message)
+            except websockets.ConnectionClosed:
+                logging.warning("WebSocket lost. Reconnecting...")
+                continue
+
+    async def handle_message(self, message):
+        data_payload = json.loads(message)
         events = data_payload if isinstance(data_payload, list) else [data_payload]
 
         for data in events:
             if data.get('event_type') == 'book':
                 asset_id = data.get('asset_id')
-                if asset_id in self.order_books:
-                    self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
-                    self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
-                    logging.info(f"CLOB for asset {asset_id} refreshed.")
-                    
-                    # Trigger Hot Path via debounce
-                    now = time.time()
-                    if now - self.last_update_times.get(asset_id, 0) > self.debounce_period:
-                        self.last_update_times[asset_id] = now
-                        self.trigger_inference(asset_id)
+                # Update local book (Memory operation - fast)
+                self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
+                self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
+                
+                # Background Log (Non-blocking)
+                asyncio.create_task(self.event_logger.log({
+                    "timestamp": time.time(),
+                    "asset_id": asset_id,
+                    "best_bid": data.get('buys')[0][0] if data.get('buys') else None
+                }))
 
-    def on_error(self, ws, error):
-        logging.error(f"WebSocket error: {error}")
+                # Trigger Hot Path (Non-blocking)
+                asyncio.create_task(self.trigger_inference_async(asset_id))
 
-    def on_close(self, ws, close_status_code, close_msg):
-        logging.info(f"WebSocket connection closed: {close_status_code} - {close_msg}")
-
-    def trigger_inference(self, market_id):
+    async def trigger_inference_async(self, market_id):
         if not self.total_gas_cost_usd:
             return
 
@@ -260,7 +192,7 @@ class MarketManager:
                     "gross_profit_usd": f"{gross_profit:.4f}",
                     "net_profit_usd": f"{net_profit:.4f}",
                 }
-                log_opportunity(opportunity_data)
+                await self.opp_logger.log(opportunity_data)
                 if net_profit > 0:
                     logging.warning(f"NET PROFITABLE ARBITRAGE FOUND: {market_data.get('question')}")
                     logging.warning(json.dumps(opportunity_data, indent=2))
@@ -303,14 +235,6 @@ class MarketManager:
             logging.error(f"Failed to fetch MATIC price from Coinbase: {e}")
             return None
 
-def log_opportunity(opportunity_data):
-    """Logs a profitable opportunity to a JSON file."""
-    try:
-        with open(OPPORTUNITIES_LOG_FILE, 'a') as f:
-            f.write(json.dumps(opportunity_data) + '\n')
-    except IOError as e:
-        logging.error(f"Error writing to opportunities log: {e}")
-
 async def main():
     logging.info("Starting atomic scanner...")
     client = ClobClient(HOST, chain_id=CHAIN_ID, creds=None)
@@ -322,18 +246,18 @@ async def main():
     # 2. Perform blocking market discovery first
     market_manager.discover_markets()
     
-    # 3. Start the WebSocket thread for real-time data
-    market_manager.start()
-    
-    # 4. Start the gas price updater task
+    # 3. Start logger workers
+    event_logger_task = asyncio.create_task(market_manager.event_logger.run_worker())
+    opp_logger_task = asyncio.create_task(market_manager.opp_logger.run_worker())
+
+    # 4. Start WebSocket and gas price updater tasks
+    ws_task = asyncio.create_task(market_manager.run_websocket())
     gas_updater_task = asyncio.create_task(market_manager.update_gas_prices())
     
     try:
-        await gas_updater_task
+        await asyncio.gather(ws_task, gas_updater_task, event_logger_task, opp_logger_task)
     except KeyboardInterrupt:
         logging.info("Scanner stopped by user.")
-        if market_manager.ws_app:
-            market_manager.ws_app.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
