@@ -30,7 +30,7 @@ OPPORTUNITIES_LOG_FILE = "missed_opportunities.json"
 EVENTS_LOG_FILE = "market_events.json"
 TARGET_SIZE_USD = Decimal('500.0')
 EXCHANGE_FEE_PERCENT = Decimal('0.001')  # 0.1%
-MIN_VOLUME_THRESHOLD = Decimal('1000.0')
+MIN_VOLUME_THRESHOLD = Decimal('1.0')
 CACHE_FILE = "market_cache.json"
 CACHE_TTL = 3600  # 1 hour
 
@@ -53,69 +53,48 @@ class MarketManager:
 
     def discover_markets(self):
         """
-        Paginates with volume-based pruning and cache checks.
+        Replaces CLOB pagination with Gamma API discovery to find active tokens.
+        Fixes the '0 event matches' and '400 Bad Request' cursor errors.
         """
-        # 1. Check for valid cache
-        if os.path.exists(CACHE_FILE):
-            if time.time() - os.path.getmtime(CACHE_FILE) < CACHE_TTL:
-                with open(CACHE_FILE, 'r') as f:
-                    cache = json.load(f)
-                    self.market_ids_to_subscribe = cache['ids']
-                    self.order_books = cache['books']
-                    logging.info(f"Loaded {len(self.market_ids_to_subscribe)} tokens from cache.")
-                    return
-
-        logging.info("Starting fresh market discovery with volume pruning...")
-        next_cursor = ""
-        total_seen = 0
+        logging.info("Starting market discovery via Gamma API...")
         
-        while True:
-            try:
-                response = self.client.get_markets(next_cursor=next_cursor)
-            except Exception as e:
-                if "400" in str(e):
-                    logging.info("Market discovery complete: Reached end of market list.")
-                else:
-                    logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
-                break
-
-            if not response or not response.get('data'):
-                break
-
-            markets_in_page = response['data']
-            total_seen += len(markets_in_page)
-
-            for market in markets_in_page:
-                is_closed = market.get('closed', False)
-                tokens = market.get('tokens', [])
-                volume_24h = Decimal(str(market.get('volume_24h', 0)))
+        # Gamma API allows filtering for active/open markets directly
+        # 'closed=false' ensures we only get currently trading markets
+        url = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=100"
+        
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            events = response.json()
+            
+            discovered_tokens = []
+            for event in events:
+                # Each event contains a 'markets' list with the actual tradable instruments
+                for market in event.get('markets', []):
+                    ids_str = market.get('clobTokenIds')
+                    if ids_str:
+                        # clobTokenIds is returned as a stringified list by Gamma API
+                        try:
+                            token_ids = json.loads(ids_str)
+                            if isinstance(token_ids, list) and len(token_ids) == 2:
+                                discovered_tokens.extend(token_ids)
+                                t0_id = token_ids[0]
+                                t1_id = token_ids[1]
+                                self.order_books[t0_id] = {"bids": [], "asks": [], "other_side": t1_id, "is_yes": True, "question": event.get("question")}
+                                self.order_books[t1_id] = {"bids": [], "asks": [], "other_side": t0_id, "is_yes": False, "question": event.get("question")}
+                        except (json.JSONDecodeError, TypeError) as e:
+                            logging.debug(f"Failed to parse token IDs: {ids_str}")
+                            continue
+            
+            # Deduplicate the list to avoid redundant WebSocket subscriptions
+            self.market_ids_to_subscribe = list(set(discovered_tokens))
+            logging.info(f"Discovery complete. Found {len(self.market_ids_to_subscribe)} active tokens.")
+            
+            if not self.market_ids_to_subscribe:
+                logging.warning("No active markets found. Verify your IP is not geo-blocked.")
                 
-                if not is_closed and len(tokens) == 2 and volume_24h >= MIN_VOLUME_THRESHOLD:
-                    t0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
-                    t1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
-                    
-                    if t0_id and t1_id:
-                        self.market_ids_to_subscribe.append(t0_id)
-                        self.market_ids_to_subscribe.append(t1_id)
-                        # Link tokens directly to avoid metadata lookups in the Hot Path
-                        self.order_books[t0_id] = {"bids": [], "asks": [], "other_side": t1_id, "is_yes": True, "question": market.get("question")}
-                        self.order_books[t1_id] = {"bids": [], "asks": [], "other_side": t0_id, "is_yes": False, "question": market.get("question")}
-
-            next_cursor = response.get('next_cursor')
-            if not next_cursor or next_cursor.lower() == "none":
-                logging.info("Finished fetching all market pages.")
-                break
-        
-        self.market_ids_to_subscribe = list(set(self.market_ids_to_subscribe))
-        
-        # 2. After loop finishes, save to cache
-        cache_data = {
-            "ids": self.market_ids_to_subscribe,
-            "books": self.order_books
-        }
-        with open(CACHE_FILE, 'w') as f:
-            json.dump(cache_data, f)
-        logging.info(f"Discovery complete. Cached {len(self.market_ids_to_subscribe)} active tokens.")
+        except Exception as e:
+            logging.error(f"Discovery failed: {e}")
 
     def start(self):
         """
@@ -202,6 +181,7 @@ class MarketManager:
                 if asset_id in self.order_books:
                     self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
                     self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
+                    logging.info(f"CLOB for asset {asset_id} refreshed.")
                     
                     # NEW: Log every refresh event for spectral embedding
                     log_event({
