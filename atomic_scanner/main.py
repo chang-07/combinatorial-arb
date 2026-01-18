@@ -29,6 +29,9 @@ API_PASSPHRASE = os.environ.get("POLYMARKET_API_PASSPHRASE")
 OPPORTUNITIES_LOG_FILE = "missed_opportunities.json"
 TARGET_SIZE_USD = Decimal('500.0')
 EXCHANGE_FEE_PERCENT = Decimal('0.001')  # 0.1%
+MIN_VOLUME_THRESHOLD = Decimal('1000.0')
+CACHE_FILE = "market_cache.json"
+CACHE_TTL = 3600  # 1 hour
 
 class MarketManager:
     def __init__(self, client: ClobClient, inference_core: InferenceCore):
@@ -49,9 +52,19 @@ class MarketManager:
 
     def discover_markets(self):
         """
-        Paginates through all markets to find CLOB-compatible ones before connecting to WebSocket.
+        Paginates with volume-based pruning and cache checks.
         """
-        logging.info("Starting market discovery...")
+        # 1. Check for valid cache
+        if os.path.exists(CACHE_FILE):
+            if time.time() - os.path.getmtime(CACHE_FILE) < CACHE_TTL:
+                with open(CACHE_FILE, 'r') as f:
+                    cache = json.load(f)
+                    self.market_ids_to_subscribe = cache['ids']
+                    self.order_books = cache['books']
+                    logging.info(f"Loaded {len(self.market_ids_to_subscribe)} tokens from cache.")
+                    return
+
+        logging.info("Starting fresh market discovery with volume pruning...")
         next_cursor = ""
         total_seen = 0
         
@@ -74,8 +87,9 @@ class MarketManager:
             for market in markets_in_page:
                 is_closed = market.get('closed', False)
                 tokens = market.get('tokens', [])
+                volume_24h = Decimal(str(market.get('volume_24h', 0)))
                 
-                if not is_closed and len(tokens) == 2:
+                if not is_closed and len(tokens) == 2 and volume_24h >= MIN_VOLUME_THRESHOLD:
                     t0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
                     t1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
                     
@@ -92,7 +106,15 @@ class MarketManager:
                 break
         
         self.market_ids_to_subscribe = list(set(self.market_ids_to_subscribe))
-        logging.info(f"Market discovery complete: Found {total_seen} markets, yielding {len(self.market_ids_to_subscribe)} CLOB tokens.")
+        
+        # 2. After loop finishes, save to cache
+        cache_data = {
+            "ids": self.market_ids_to_subscribe,
+            "books": self.order_books
+        }
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(cache_data, f)
+        logging.info(f"Discovery complete. Cached {len(self.market_ids_to_subscribe)} active tokens.")
 
     def start(self):
         """
