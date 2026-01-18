@@ -1,32 +1,79 @@
-### **Agent Task: Transition to Anonymous Real-Time Monitoring**
+### **Agent Task: Fix Market Discovery with Pagination**
 
 **Objective:**
-Refactor the `atomic_scanner/main.py` script to support **Anonymous (Unauthenticated) WebSocket Monitoring** for Phase 1. The current implementation fails because it attempts an authenticated handshake with missing L2 API credentials (API Secret and Passphrase). Since public market data and order book updates do not require authentication on Polymarket, the engine must be adjusted to run in public mode.
+Update `atomic_scanner/main.py` to ensure the scanner finds all available CLOB markets. The current implementation only fetches the first page of market data, causing it to miss critical trading opportunities.
 
 ---
 
-### **1. WebSocket Refactoring (Anonymous Mode)**
-* **Remove Auth Handshake:** Modify the `run_websocket` method in the `MarketManager` class to remove the `auth_payload` and the `Authorization` header from the `websocket.WebSocketApp` initialization.
-* **Connection Logic:** Ensure the connection to `WEBSOCKET_URL` is established without any security tokens.
-* **Public Subscription:** The `on_open` method must continue to send a subscription message to the `market` channel using the correct format for public streams: `{"type": "subscribe", "channel": "market", "markets": [market_ids]}`.
+### **1. Pagination Implementation**
+* **Loop through All Pages:** Refactor the `on_open` method in the `MarketManager` class to use a `while True` loop. 
+* **Correct Parameter Name:** Use `next_cursor` as the keyword argument in `self.client.get_markets(next_cursor=...)`. Do **not** use `cursor`, as it causes an "unexpected keyword argument" error.
+* **Termination Condition:** The loop must break when the API response no longer contains a `next_cursor` or when the `data` list is empty.
 
-### **2. Environment Variable & Configuration Updates**
-* **Optional Credentials:** Update the script to make `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, and `POLYMARKET_API_PASSPHRASE` optional.
-* **Graceful Warnings:** If these keys are missing, the script should log a `WARNING` stating that it is running in "Read-Only/Public Mode" rather than terminating the process.
-* **Maintain CoinMarketCap:** Keep `COINMARKETCAP_API_KEY` as a **mandatory** requirement. This is still necessary to fetch MATIC/USD prices for the real-time friction accounting required by Phase 1.3.
+### **2. Enhanced Filtering**
+* **Active Market Validation:** Within the loop, ensure markets are only added to the subscription list if:
+    1. `accepting_orders` is `True`.
+    2. `closed` is `False`.
+    3. The market has exactly `2` tokens with valid `clobTokenId` values.
+* **State Initialization:** Properly initialize `self.order_books` for every discovered `token0` and `token1` to prevent `KeyError` during WebSocket updates.
 
-### **3. Logic Preservation ("Hot Path" Integrity)**
-* **InferenceCore Protection:** Do **not** modify the `inference_core.py` file or the `InferenceCore` class.
-* **WAP Continuity:** Ensure the Weighted Average Price (WAP) calculation for the **500 USDC Target Size** remains the primary filter for trade viability.
-* **Debounce & Performance:** Retain the `0.5s` debounce period and the `MarketManager`'s local state management to prevent CPU bottlenecking during high-frequency updates.
-
-### **4. Execution Logging for Phase 2**
-* **Persistence:** Ensure all opportunities where `gross_profit > 0` are appended to `missed_opportunities.json`.
-* **Data Schema:** Each log entry must include the `timestamp`, `market_question`, `wap_yes`, `wap_no`, `gas_price_gwei`, and `total_cost_usd`. This dataset is critical for the upcoming **Phase 2: Spectral Clustering and Graph Laplacian** implementation.
+### **3. Anonymous WebSocket Integrity**
+* **Maintain Public Mode:** Ensure the `on_open` method still sends the standard public subscription message: `{"type": "subscribe", "channel": "market", "markets": [market_ids]}`.
+* **Logging:** Add a log statement indicating how many total markets were found and subscribed to after the full pagination scan completes.
 
 ---
 
 **Success Criteria:**
-1. The script connects to the Polymarket WebSocket without an `Authorization` error.
-2. It successfully logs "Subscribed to [X] order books" and starts receiving market updates.
-3. The `update_gas_prices` loop continues to run in the background every 60 seconds to provide the `total_gas_cost_usd` for the inference engine.
+1. The scanner successfully retrieves multiple pages of markets from the Polymarket API.
+2. The error regarding the `cursor` argument is resolved by using `next_cursor`.
+3. The scanner logs a high volume of subscriptions (e.g., "Subscribed to 400+ order books") instead of zero or a single page's worth.
+
+# Example on_open(self,ws):
+def on_open(self, ws):
+        logging.info("WebSocket connection opened. Fetching all active markets...")
+        market_ids = []
+        next_cursor = ""
+        
+        while True:
+            try:
+                # Use next_cursor for pagination; empty string for the first page
+                response = self.client.get_markets(next_cursor=next_cursor)
+            except Exception as e:
+                logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
+                break
+
+            if not response or not response.get('data'):
+                break
+
+            for market in response['data']:
+                # Filter for active, non-closed markets with exactly 2 tokens
+                if (market.get('accepting_orders') and 
+                    not market.get('closed') and 
+                    len(market.get('tokens', [])) == 2):
+                    
+                    token0_id = market['tokens'][0]['clobTokenId']
+                    token1_id = market['tokens'][1]['clobTokenId']
+                    
+                    if token0_id and token1_id:
+                        market_ids.append(token0_id)
+                        market_ids.append(token1_id)
+                        # Initialize local order book state
+                        self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
+                        self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
+
+            # Check if there is another page
+            next_cursor = response.get('next_cursor')
+            if not next_cursor:
+                break
+        
+        if not market_ids:
+            logging.warning("No CLOB-compatible markets found after full scan.")
+            return
+
+        subscription_message = {
+            "type": "subscribe",
+            "channel": "market",
+            "markets": market_ids,
+        }
+        ws.send(json.dumps(subscription_message))
+        logging.info(f"Subscribed to {len(market_ids)} order books across {len(market_ids)//2} markets.")

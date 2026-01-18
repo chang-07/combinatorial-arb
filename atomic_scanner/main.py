@@ -40,6 +40,9 @@ class MarketManager:
         self.total_gas_cost_usd = None
         self.ws_app = None
         self.ws_thread = None
+        self.reconnect_interval = 5  # Initial reconnect interval in seconds
+        self.reconnect_attempts = 0
+        self.max_reconnect_interval = 60  # Maximum reconnect interval
 
     def start(self):
         self.ws_thread = threading.Thread(target=self.run_websocket)
@@ -51,40 +54,82 @@ class MarketManager:
             logging.warning("Polymarket API keys not found. Running in Read-Only/Public Mode.")
         
         furl = WEBSOCKET_URL + "/ws/market"
-        self.ws_app = websocket.WebSocketApp(
-            furl,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-        self.ws_app.run_forever()
+        
+        while True:
+            self.ws_app = websocket.WebSocketApp(
+                furl,
+                on_open=self.on_open,
+                on_message=self.on_message,
+                on_error=self.on_error,
+                on_close=self.on_close
+            )
+            try:
+                self.ws_app.run_forever()
+            except Exception as e:
+                logging.error(f"WebSocket run_forever() failed with exception: {e}")
+
+            # Exponential backoff
+            self.reconnect_attempts += 1
+            wait_time = min(self.reconnect_interval * (2 ** self.reconnect_attempts), self.max_reconnect_interval)
+            logging.info(f"WebSocket connection lost. Attempting to reconnect in {wait_time} seconds...")
+            time.sleep(wait_time)
+
+
 
     def on_open(self, ws):
-        logging.info("WebSocket connection opened.")
-        active_markets = self.client.get_markets()
-        if not active_markets or not active_markets.get('data'):
-            logging.warning("No active markets found to subscribe.")
+        logging.info("WebSocket connection opened. Fetching all active markets...")
+        self.reconnect_attempts = 0
+        market_ids = []
+        next_cursor = ""  # Start with an empty cursor for the first page
+        
+        while True:
+            try:
+                # Use next_cursor for pagination
+                response = self.client.get_markets(next_cursor=next_cursor)
+            except Exception as e:
+                logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
+                break
+
+            if not response or not response.get('data'):
+                logging.info("No market data in response.")
+                break
+
+            for market in response['data']:
+                # Filter for active, non-closed markets with exactly 2 tokens
+                if (market.get('accepting_orders') and 
+                    not market.get('closed') and 
+                    len(market.get('tokens', [])) == 2):
+                    
+                    token0 = market.get('tokens', [{}])[0]
+                    token1 = market.get('tokens', [{}])[1]
+
+                    token0_id = token0.get('clobTokenId')
+                    token1_id = token1.get('clobTokenId')
+                    
+                    if token0_id and token1_id:
+                        market_ids.append(token0_id)
+                        market_ids.append(token1_id)
+                        # Initialize local order book state
+                        self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
+                        self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
+
+            # Check if there is another page
+            next_cursor = response.get('meta', {}).get('next_cursor')
+            if not next_cursor:
+                logging.info("Finished fetching all market pages.")
+                break
+        
+        if not market_ids:
+            logging.warning("No CLOB-compatible markets found after full scan.")
             return
 
-        market_ids = []
-        for market in active_markets['data']:
-            if market.get('accepting_orders') and len(market.get('tokens', [])) == 2:
-                token0_id = market['tokens'][0]['clobTokenId']
-                token1_id = market['tokens'][1]['clobTokenId']
-                if token0_id and token1_id:
-                    market_ids.append(token0_id)
-                    market_ids.append(token1_id)
-                    self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
-                    self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
-        
         subscription_message = {
             "type": "subscribe",
             "channel": "market",
-            "markets": market_ids,
+            "markets": list(set(market_ids)), # Use set to ensure unique token IDs
         }
         ws.send(json.dumps(subscription_message))
-        logging.info(f"Subscribed to {len(market_ids)} order books.")
+        logging.info(f"Subscribed to {len(set(market_ids))} order books across {len(set(market_ids))//2} markets.")
 
     def on_message(self, ws, message):
         data = json.loads(message)
