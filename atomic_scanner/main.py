@@ -34,21 +34,6 @@ MIN_VOLUME_THRESHOLD = Decimal('1.0')
 CACHE_FILE = "market_cache.json"
 CACHE_TTL = 3600  # 1 hour
 
-class AsyncLogger:
-    def __init__(self, filename):
-        self.filename = filename
-        self.queue = asyncio.Queue()
-
-    async def log(self, data):
-        await self.queue.put(data)
-
-    async def run_worker(self):
-        while True:
-            data = await self.queue.get()
-            async with aiofiles.open(self.filename, mode='a') as f:
-                await f.write(json.dumps(data) + '\n')
-            self.queue.task_done()
-
 class MarketManager:
     def __init__(self, client: ClobClient, inference_core: InferenceCore):
         self.client = client
@@ -58,10 +43,17 @@ class MarketManager:
         self.debounce_period = 0.5  # 500ms
         self.gas_price_gwei = None
         self.total_gas_cost_usd = None
-        self.event_logger = AsyncLogger(EVENTS_LOG_FILE)
-        self.opp_logger = AsyncLogger(OPPORTUNITIES_LOG_FILE)
+        self.log_queue = asyncio.Queue()
         self.market_ids_to_subscribe = []
         self.gas_refreshes = 0
+
+    async def log_worker(self):
+        """Background worker to handle all disk writes."""
+        while True:
+            file_path, data = await self.log_queue.get()
+            async with aiofiles.open(file_path, mode='a') as f:
+                await f.write(json.dumps(data) + '\n')
+            self.log_queue.task_done()
 
     def discover_markets(self):
         """
@@ -109,43 +101,35 @@ class MarketManager:
             logging.error(f"Discovery failed: {e}")
 
     async def run_websocket(self):
+        """Async WebSocket consumer."""
         uri = f"{WEBSOCKET_URL}/ws/market"
         async for websocket in websockets.connect(uri):
             try:
-                # 1. Subscribe
-                subscription_message = {
-                    "type": "market",
-                    "assets_ids": self.market_ids_to_subscribe,
-                }
-                await websocket.send(json.dumps(subscription_message))
+                # Subscription logic
+                sub_msg = {"type": "market", "assets_ids": self.market_ids_to_subscribe}
+                await websocket.send(json.dumps(sub_msg))
                 
-                # 2. Consume Messages
                 async for message in websocket:
-                    await self.handle_message(message)
-            except websockets.ConnectionClosed:
-                logging.warning("WebSocket lost. Reconnecting...")
-                continue
+                    data = json.loads(message)
+                    # Offload processing to background
+                    asyncio.create_task(self.handle_event(data))
+            except Exception as e:
+                logging.error(f"WS Error: {e}")
+                await asyncio.sleep(5)
 
-    async def handle_message(self, message):
-        data_payload = json.loads(message)
-        events = data_payload if isinstance(data_payload, list) else [data_payload]
-
-        for data in events:
-            if data.get('event_type') == 'book':
-                asset_id = data.get('asset_id')
-                # Update local book (Memory operation - fast)
-                self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
-                self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
-                
-                # Background Log (Non-blocking)
-                asyncio.create_task(self.event_logger.log({
-                    "timestamp": time.time(),
-                    "asset_id": asset_id,
-                    "best_bid": data.get('buys')[0][0] if data.get('buys') else None
-                }))
-
-                # Trigger Hot Path (Non-blocking)
-                asyncio.create_task(self.trigger_inference_async(asset_id))
+    async def handle_event(self, data):
+        """Processes a single event without blocking the socket."""
+        if data.get('event_type') == 'book':
+            asset_id = data.get('asset_id')
+            # Memory update (Fast)
+            self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
+            self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
+            
+            # Queue for logging (Fast)
+            await self.log_queue.put((EVENTS_LOG_FILE, {"timestamp": time.time(), "asset_id": asset_id}))
+            
+            # Trigger math in task (Non-blocking)
+            asyncio.create_task(self.trigger_inference_async(asset_id))
 
     async def trigger_inference_async(self, market_id):
         if not self.total_gas_cost_usd:
@@ -192,7 +176,7 @@ class MarketManager:
                     "gross_profit_usd": f"{gross_profit:.4f}",
                     "net_profit_usd": f"{net_profit:.4f}",
                 }
-                await self.opp_logger.log(opportunity_data)
+                await self.log_queue.put((OPPORTUNITIES_LOG_FILE, opportunity_data))
                 if net_profit > 0:
                     logging.warning(f"NET PROFITABLE ARBITRAGE FOUND: {market_data.get('question')}")
                     logging.warning(json.dumps(opportunity_data, indent=2))
@@ -246,16 +230,15 @@ async def main():
     # 2. Perform blocking market discovery first
     market_manager.discover_markets()
     
-    # 3. Start logger workers
-    event_logger_task = asyncio.create_task(market_manager.event_logger.run_worker())
-    opp_logger_task = asyncio.create_task(market_manager.opp_logger.run_worker())
+    # 3. Start logger worker
+    log_worker_task = asyncio.create_task(market_manager.log_worker())
 
     # 4. Start WebSocket and gas price updater tasks
     ws_task = asyncio.create_task(market_manager.run_websocket())
     gas_updater_task = asyncio.create_task(market_manager.update_gas_prices())
     
     try:
-        await asyncio.gather(ws_task, gas_updater_task, event_logger_task, opp_logger_task)
+        await asyncio.gather(ws_task, gas_updater_task, log_worker_task)
     except KeyboardInterrupt:
         logging.info("Scanner stopped by user.")
 
