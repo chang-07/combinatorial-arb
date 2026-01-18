@@ -1,79 +1,34 @@
-### **Agent Task: Fix Market Discovery with Pagination**
+### **Agent Task: Resolve WebSocket Heartbeat Configuration Error**
 
 **Objective:**
-Update `atomic_scanner/main.py` to ensure the scanner finds all available CLOB markets. The current implementation only fetches the first page of market data, causing it to miss critical trading opportunities.
+Refactor `atomic_scanner/main.py` to fix the `Ensure ping_interval > ping_timeout` exception that is causing the WebSocket connection to enter a rapid failure and reconnection loop.
 
 ---
 
-### **1. Pagination Implementation**
-* **Loop through All Pages:** Refactor the `on_open` method in the `MarketManager` class to use a `while True` loop. 
-* **Correct Parameter Name:** Use `next_cursor` as the keyword argument in `self.client.get_markets(next_cursor=...)`. Do **not** use `cursor`, as it causes an "unexpected keyword argument" error.
-* **Termination Condition:** The loop must break when the API response no longer contains a `next_cursor` or when the `data` list is empty.
+### **1. Fix WebSocket Heartbeat Logic**
+* **The Problem**: In the `MarketManager.run_websocket` method, the `ping_interval` is set to 10 seconds and the `ping_timeout` is set to 20 seconds. The `websocket-client` library requires the interval between pings to be strictly greater than the timeout duration.
+* **The Fix**: Update the `run_forever` parameters to ensure the interval is longer than the timeout.
+* **Critical Code Adjustment**:
+    ```python
+    # Inside run_websocket method
+    self.ws_app.run_forever(
+        ping_interval=30,  # Increased to be > timeout
+        ping_timeout=10,   # Set lower than interval
+        sslopt={"cert_reqs": ssl.CERT_NONE}
+    )
+    ```
 
-### **2. Enhanced Filtering**
-* **Active Market Validation:** Within the loop, ensure markets are only added to the subscription list if:
-    1. `accepting_orders` is `True`.
-    2. `closed` is `False`.
-    3. The market has exactly `2` tokens with valid `clobTokenId` values.
-* **State Initialization:** Properly initialize `self.order_books` for every discovered `token0` and `token1` to prevent `KeyError` during WebSocket updates.
+---
 
-### **3. Anonymous WebSocket Integrity**
-* **Maintain Public Mode:** Ensure the `on_open` method still sends the standard public subscription message: `{"type": "subscribe", "channel": "market", "markets": [market_ids]}`.
-* **Logging:** Add a log statement indicating how many total markets were found and subscribed to after the full pagination scan completes.
+### **2. Maintain System Integrity**
+* **Market Discovery**: Ensure the `discover_markets()` method remains as the primary blocking initialization step. It successfully identifies over 50,000 tokens, which must be preserved for the subscription phase.
+* **Subscription Batching**: Keep the chunking logic (500 tokens per batch) in `on_open` to comply with Polymarket's connection limits.
+* **Friction Accounting**: Ensure the `update_gas_prices` task continues to run every 60 seconds to provide accurate `total_gas_cost_usd` for the `InferenceCore`.
+* **Hot Path Isolation**: Do **not** modify `inference_core.py`. The calculation logic must remain pure for future C++ porting.
 
 ---
 
 **Success Criteria:**
-1. The scanner successfully retrieves multiple pages of markets from the Polymarket API.
-2. The error regarding the `cursor` argument is resolved by using `next_cursor`.
-3. The scanner logs a high volume of subscriptions (e.g., "Subscribed to 400+ order books") instead of zero or a single page's worth.
-
-# Example on_open(self,ws):
-def on_open(self, ws):
-        logging.info("WebSocket connection opened. Fetching all active markets...")
-        market_ids = []
-        next_cursor = ""
-        
-        while True:
-            try:
-                # Use next_cursor for pagination; empty string for the first page
-                response = self.client.get_markets(next_cursor=next_cursor)
-            except Exception as e:
-                logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
-                break
-
-            if not response or not response.get('data'):
-                break
-
-            for market in response['data']:
-                # Filter for active, non-closed markets with exactly 2 tokens
-                if (market.get('accepting_orders') and 
-                    not market.get('closed') and 
-                    len(market.get('tokens', [])) == 2):
-                    
-                    token0_id = market['tokens'][0]['clobTokenId']
-                    token1_id = market['tokens'][1]['clobTokenId']
-                    
-                    if token0_id and token1_id:
-                        market_ids.append(token0_id)
-                        market_ids.append(token1_id)
-                        # Initialize local order book state
-                        self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
-                        self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
-
-            # Check if there is another page
-            next_cursor = response.get('next_cursor')
-            if not next_cursor:
-                break
-        
-        if not market_ids:
-            logging.warning("No CLOB-compatible markets found after full scan.")
-            return
-
-        subscription_message = {
-            "type": "subscribe",
-            "channel": "market",
-            "markets": market_ids,
-        }
-        ws.send(json.dumps(subscription_message))
-        logging.info(f"Subscribed to {len(market_ids)} order books across {len(market_ids)//2} markets.")
+1. The `WebSocket run_forever() failed` exception is resolved.
+2. The scanner successfully finishes the batch subscription process for all 52,000+ discovered tokens.
+3. The connection remains stable, and the engine starts processing live `event_type: 'book'` updates.

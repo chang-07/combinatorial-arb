@@ -1,3 +1,4 @@
+import ssl
 import time
 import logging
 import os
@@ -43,13 +44,69 @@ class MarketManager:
         self.reconnect_interval = 5  # Initial reconnect interval in seconds
         self.reconnect_attempts = 0
         self.max_reconnect_interval = 60  # Maximum reconnect interval
+        self.gas_refreshes = 0
+        self.market_ids_to_subscribe = []
+
+    def discover_markets(self):
+        """
+        Paginates through all markets to find CLOB-compatible ones before connecting to WebSocket.
+        """
+        logging.info("Starting market discovery...")
+        next_cursor = ""
+        total_seen = 0
+        
+        while True:
+            try:
+                response = self.client.get_markets(next_cursor=next_cursor)
+            except Exception as e:
+                if "400" in str(e):
+                    logging.info("Market discovery complete: Reached end of market list.")
+                else:
+                    logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
+                break
+
+            if not response or not response.get('data'):
+                break
+
+            markets_in_page = response['data']
+            total_seen += len(markets_in_page)
+
+            for market in markets_in_page:
+                is_closed = market.get('closed', False)
+                tokens = market.get('tokens', [])
+                
+                if not is_closed and len(tokens) == 2:
+                    t0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
+                    t1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
+                    
+                    if t0_id and t1_id:
+                        self.market_ids_to_subscribe.append(t0_id)
+                        self.market_ids_to_subscribe.append(t1_id)
+                        # Link tokens directly to avoid metadata lookups in the Hot Path
+                        self.order_books[t0_id] = {"bids": [], "asks": [], "other_side": t1_id, "is_yes": True, "question": market.get("question")}
+                        self.order_books[t1_id] = {"bids": [], "asks": [], "other_side": t0_id, "is_yes": False, "question": market.get("question")}
+
+            next_cursor = response.get('next_cursor')
+            if not next_cursor or next_cursor.lower() == "none":
+                logging.info("Finished fetching all market pages.")
+                break
+        
+        self.market_ids_to_subscribe = list(set(self.market_ids_to_subscribe))
+        logging.info(f"Market discovery complete: Found {total_seen} markets, yielding {len(self.market_ids_to_subscribe)} CLOB tokens.")
 
     def start(self):
+        """
+        Starts the WebSocket connection thread.
+        """
+        logging.info("MarketManager: Starting WebSocket thread...")
         self.ws_thread = threading.Thread(target=self.run_websocket)
         self.ws_thread.daemon = True
         self.ws_thread.start()
+        logging.info("MarketManager: WebSocket thread started.")
+
 
     def run_websocket(self):
+        logging.info("MarketManager: run_websocket method executing in new thread.")
         if not API_KEY or not API_SECRET or not API_PASSPHRASE:
             logging.warning("Polymarket API keys not found. Running in Read-Only/Public Mode.")
         
@@ -64,7 +121,11 @@ class MarketManager:
                 on_close=self.on_close
             )
             try:
-                self.ws_app.run_forever()
+                self.ws_app.run_forever(
+                    ping_interval=30, 
+                    ping_timeout=10, 
+                    sslopt={"cert_reqs": ssl.CERT_NONE}
+                )
             except Exception as e:
                 logging.error(f"WebSocket run_forever() failed with exception: {e}")
 
@@ -75,81 +136,56 @@ class MarketManager:
             time.sleep(wait_time)
 
     def on_open(self, ws):
-            logging.info("WebSocket connection opened. Fetching all active markets...")
-            market_ids = []
-            next_cursor = ""
-            total_seen = 0
-            
-            while True:
-                try:
-                    # Call API with pagination cursor
-                    response = self.client.get_markets(next_cursor=next_cursor)
-                except Exception as e:
-                    logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
-                    break
+        logging.info("WebSocket connection opened.")
+        self.reconnect_attempts = 0
 
-                if not response or not response.get('data'):
-                    break
+        if not self.market_ids_to_subscribe:
+            logging.warning("No markets to subscribe to were found during discovery phase.")
+            return
 
-                markets_in_page = response['data']
-                total_seen += len(markets_in_page)
-
-                for market in markets_in_page:
-                    # Debug logging for the first market to verify schema
-                    if total_seen == len(markets_in_page):
-                        logging.debug(f"Sample market structure: {json.dumps(market, indent=2)}")
-
-                    # Improved filtering: 
-                    # 1. Must not be closed
-                    # 2. Must have exactly 2 tokens (Binary Market)
-                    is_closed = market.get('closed', False)
-                    tokens = market.get('tokens', [])
-                    
-                    if not is_closed and len(tokens) == 2:
-                        # Check for token IDs using multiple possible keys
-                        token0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
-                        token1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
-                        
-                        if token0_id and token1_id:
-                            market_ids.append(token0_id)
-                            market_ids.append(token1_id)
-                            
-                            # Initialize local state
-                            self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
-                            self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
-
-                # Handle pagination
-                next_cursor = response.get('next_cursor')
-                # If next_cursor is "none" (string) or empty, we have reached the end
-                if not next_cursor or next_cursor.lower() == "none":
-                    break
-            
-                logging.info(f"Scan complete. Processed {total_seen} markets.")
-                
-                if not market_ids:
-                    logging.warning("No CLOB-compatible markets found. Check if 'clobTokenId' or 'token_id' exists in API response.")
-                    return
-
-                subscription_message = {
-                    "type": "subscribe",
-                    "channel": "market",
-                    "markets": market_ids,
-                }
-                ws.send(json.dumps(subscription_message))
-                logging.info(f"Subscribed to {len(market_ids)} order books ({len(market_ids)//2} markets).")
+        # Batch subscription requests
+        chunk_size = 500
+        delay_between_batches = 0.1
+        total_tokens = len(self.market_ids_to_subscribe)
+        
+        logging.info(f"Subscribing to {total_tokens} tokens in batches...")
+        for i in range(0, total_tokens, chunk_size):
+            batch = self.market_ids_to_subscribe[i:i + chunk_size]
+            subscription_message = {
+                "type": "market",
+                "assets_ids": batch,
+            }
+            ws.send(json.dumps(subscription_message))
+            if total_tokens > chunk_size:
+                time.sleep(delay_between_batches)
+        
+        logging.info("Finished sending all subscription requests.")
 
     def on_message(self, ws, message):
-        data = json.loads(message)
-        if data.get('channel') == 'market' and 'market' in data:
-            market_id = data['market']
-            if market_id in self.order_books:
-                self.order_books[market_id].update(data['data'])
-                
-                now = time.time()
-                last_update = self.last_update_times.get(market_id, 0)
-                if now - last_update > self.debounce_period:
-                    self.last_update_times[market_id] = now
-                    self.trigger_inference(market_id)
+        if not message:
+            return # Ignore empty keep-alive frames
+            
+        try:
+            data_payload = json.loads(message)
+        except json.JSONDecodeError:
+            return # Guard against non-JSON data
+
+        # Polymarket often sends batches as lists; wrap single dicts to normalize
+        events = data_payload if isinstance(data_payload, list) else [data_payload]
+
+        for data in events:
+            if data.get('event_type') == 'book':
+                asset_id = data.get('asset_id')
+                if asset_id in self.order_books:
+                    self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
+                    self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
+                    logging.info(f"CLOB for asset {asset_id} refreshed.")
+                    
+                    # Trigger Hot Path via debounce
+                    now = time.time()
+                    if now - self.last_update_times.get(asset_id, 0) > self.debounce_period:
+                        self.last_update_times[asset_id] = now
+                        self.trigger_inference(asset_id)
 
     def on_error(self, ws, error):
         logging.error(f"WebSocket error: {error}")
@@ -164,17 +200,19 @@ class MarketManager:
         market_data = self.order_books.get(market_id)
         if not market_data:
             return
-            
-        parent_market_info = market_data['market_info']
-        tokens = parent_market_info['tokens']
-        token0_id = tokens[0]['clobTokenId']
-        token1_id = tokens[1]['clobTokenId']
 
-        if token0_id not in self.order_books or token1_id not in self.order_books:
+        other_side_id = market_data.get("other_side")
+        if not other_side_id or other_side_id not in self.order_books:
             return
+            
+        other_side_market_data = self.order_books.get(other_side_id)
 
-        book_yes = self.order_books[token0_id]['asks']
-        book_no = self.order_books[token1_id]['asks']
+        if market_data["is_yes"]:
+            book_yes = market_data['asks']
+            book_no = other_side_market_data['asks']
+        else:
+            book_yes = other_side_market_data['asks']
+            book_no = market_data['asks']
 
         if not book_yes or not book_no:
             return
@@ -192,8 +230,7 @@ class MarketManager:
             if gross_profit > 0:
                 opportunity_data = {
                     "timestamp": time.time(),
-                    "market_id": parent_market_info.get("id"),
-                    "market_question": parent_market_info.get("question"),
+                    "market_question": market_data.get("question"),
                     "wap_yes": f"{wap_yes:.4f}",
                     "wap_no": f"{wap_no:.4f}",
                     "gas_price_gwei": f"{self.gas_price_gwei:.4f}",
@@ -203,11 +240,12 @@ class MarketManager:
                 }
                 log_opportunity(opportunity_data)
                 if net_profit > 0:
-                    logging.warning(f"NET PROFITABLE ARBITRAGE FOUND: {parent_market_info.get('question')}")
+                    logging.warning(f"NET PROFITABLE ARBITRAGE FOUND: {market_data.get('question')}")
                     logging.warning(json.dumps(opportunity_data, indent=2))
 
     async def update_gas_prices(self):
         while True:
+            logging.info("Refreshing gas prices...")
             try:
                 response = requests.get(POLYGON_GAS_STATION_URL)
                 response.raise_for_status()
@@ -218,12 +256,13 @@ class MarketManager:
 
                 matic_price_usd = self.get_matic_price_usd()
                 if matic_price_usd:
+                    self.gas_refreshes += 1
                     gas_limit_per_tx = Decimal('200000')
                     num_transactions = 2
                     total_gas_cost_gwei = self.gas_price_gwei * gas_limit_per_tx * num_transactions
                     total_gas_cost_matic = total_gas_cost_gwei / Decimal('1000000000')
                     self.total_gas_cost_usd = total_gas_cost_matic * matic_price_usd
-                    logging.info(f"Updated gas cost: ${self.total_gas_cost_usd:.4f}")
+                    logging.info(f"Updated gas cost: ${self.total_gas_cost_usd:.4f} (Refresh #{self.gas_refreshes})")
             except (requests.exceptions.RequestException, KeyError, InvalidOperation) as e:
                 logging.error(f"Failed to update gas prices: {e}")
             
@@ -254,17 +293,25 @@ async def main():
     logging.info("Starting atomic scanner...")
     client = ClobClient(HOST, chain_id=CHAIN_ID, creds=None)
     inference_core = InferenceCore()
+    
+    # 1. Create manager instance
     market_manager = MarketManager(client, inference_core)
     
+    # 2. Perform blocking market discovery first
+    market_manager.discover_markets()
+    
+    # 3. Start the WebSocket thread for real-time data
     market_manager.start()
     
+    # 4. Start the gas price updater task
     gas_updater_task = asyncio.create_task(market_manager.update_gas_prices())
     
     try:
         await gas_updater_task
     except KeyboardInterrupt:
         logging.info("Scanner stopped by user.")
-        market_manager.ws_app.close()
+        if market_manager.ws_app:
+            market_manager.ws_app.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
