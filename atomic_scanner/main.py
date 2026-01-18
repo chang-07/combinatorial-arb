@@ -72,14 +72,15 @@ class MarketManager:
                 tokens = market.get('tokens', [])
                 
                 if not is_closed and len(tokens) == 2:
-                    token0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
-                    token1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
+                    t0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
+                    t1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
                     
-                    if token0_id and token1_id:
-                        self.market_ids_to_subscribe.append(token0_id)
-                        self.market_ids_to_subscribe.append(token1_id)
-                        self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
-                        self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
+                    if t0_id and t1_id:
+                        self.market_ids_to_subscribe.append(t0_id)
+                        self.market_ids_to_subscribe.append(t1_id)
+                        # Link tokens directly to avoid metadata lookups in the Hot Path
+                        self.order_books[t0_id] = {"bids": [], "asks": [], "other_side": t1_id, "is_yes": True, "question": market.get("question")}
+                        self.order_books[t1_id] = {"bids": [], "asks": [], "other_side": t0_id, "is_yes": False, "question": market.get("question")}
 
             next_cursor = response.get('next_cursor')
             if not next_cursor or next_cursor.lower() == "none":
@@ -155,15 +156,17 @@ class MarketManager:
     def on_message(self, ws, message):
         data = json.loads(message)
         if data.get('event_type') == 'book':
-            market_id = data.get('asset_id')
-            if market_id in self.order_books:
-                self.order_books[market_id].update(data)
+            asset_id = data.get('asset_id')
+            if asset_id in self.order_books:
+                # Polymarket L2 format is [price, size]
+                self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
+                self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
                 
                 now = time.time()
-                last_update = self.last_update_times.get(market_id, 0)
+                last_update = self.last_update_times.get(asset_id, 0)
                 if now - last_update > self.debounce_period:
-                    self.last_update_times[market_id] = now
-                    self.trigger_inference(market_id)
+                    self.last_update_times[asset_id] = now
+                    self.trigger_inference(asset_id)
 
     def on_error(self, ws, error):
         logging.error(f"WebSocket error: {error}")
@@ -178,17 +181,19 @@ class MarketManager:
         market_data = self.order_books.get(market_id)
         if not market_data:
             return
-            
-        parent_market_info = market_data['market_info']
-        tokens = parent_market_info['tokens']
-        token0_id = tokens[0]['clobTokenId']
-        token1_id = tokens[1]['clobTokenId']
 
-        if token0_id not in self.order_books or token1_id not in self.order_books:
+        other_side_id = market_data.get("other_side")
+        if not other_side_id or other_side_id not in self.order_books:
             return
+            
+        other_side_market_data = self.order_books.get(other_side_id)
 
-        book_yes = self.order_books[token0_id]['asks']
-        book_no = self.order_books[token1_id]['asks']
+        if market_data["is_yes"]:
+            book_yes = market_data['asks']
+            book_no = other_side_market_data['asks']
+        else:
+            book_yes = other_side_market_data['asks']
+            book_no = market_data['asks']
 
         if not book_yes or not book_no:
             return
@@ -206,8 +211,7 @@ class MarketManager:
             if gross_profit > 0:
                 opportunity_data = {
                     "timestamp": time.time(),
-                    "market_id": parent_market_info.get("id"),
-                    "market_question": parent_market_info.get("question"),
+                    "market_question": market_data.get("question"),
                     "wap_yes": f"{wap_yes:.4f}",
                     "wap_no": f"{wap_no:.4f}",
                     "gas_price_gwei": f"{self.gas_price_gwei:.4f}",
@@ -217,7 +221,7 @@ class MarketManager:
                 }
                 log_opportunity(opportunity_data)
                 if net_profit > 0:
-                    logging.warning(f"NET PROFITABLE ARBITRAGE FOUND: {parent_market_info.get('question')}")
+                    logging.warning(f"NET PROFITABLE ARBITRAGE FOUND: {market_data.get('question')}")
                     logging.warning(json.dumps(opportunity_data, indent=2))
 
     async def update_gas_prices(self):
