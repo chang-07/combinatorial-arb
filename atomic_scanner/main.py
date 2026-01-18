@@ -1,3 +1,4 @@
+import ssl
 import time
 import logging
 import os
@@ -58,7 +59,10 @@ class MarketManager:
             try:
                 response = self.client.get_markets(next_cursor=next_cursor)
             except Exception as e:
-                logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
+                if "400" in str(e):
+                    logging.info("Market discovery complete: Reached end of market list.")
+                else:
+                    logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
                 break
 
             if not response or not response.get('data'):
@@ -117,7 +121,11 @@ class MarketManager:
                 on_close=self.on_close
             )
             try:
-                self.ws_app.run_forever(ping_interval=20, ping_timeout=10)
+                self.ws_app.run_forever(
+                    ping_interval=10, 
+                    ping_timeout=20, 
+                    sslopt={"cert_reqs": ssl.CERT_NONE}
+                )
             except Exception as e:
                 logging.error(f"WebSocket run_forever() failed with exception: {e}")
 
@@ -154,19 +162,30 @@ class MarketManager:
         logging.info("Finished sending all subscription requests.")
 
     def on_message(self, ws, message):
-        data = json.loads(message)
-        if data.get('event_type') == 'book':
-            asset_id = data.get('asset_id')
-            if asset_id in self.order_books:
-                # Polymarket L2 format is [price, size]
-                self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
-                self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
-                
-                now = time.time()
-                last_update = self.last_update_times.get(asset_id, 0)
-                if now - last_update > self.debounce_period:
-                    self.last_update_times[asset_id] = now
-                    self.trigger_inference(asset_id)
+        if not message:
+            return # Ignore empty keep-alive frames
+            
+        try:
+            data_payload = json.loads(message)
+        except json.JSONDecodeError:
+            return # Guard against non-JSON data
+
+        # Polymarket often sends batches as lists; wrap single dicts to normalize
+        events = data_payload if isinstance(data_payload, list) else [data_payload]
+
+        for data in events:
+            if data.get('event_type') == 'book':
+                asset_id = data.get('asset_id')
+                if asset_id in self.order_books:
+                    # Update internal L2 state from [price, size] format
+                    self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
+                    self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
+                    
+                    # Trigger Hot Path via debounce
+                    now = time.time()
+                    if now - self.last_update_times.get(asset_id, 0) > self.debounce_period:
+                        self.last_update_times[asset_id] = now
+                        self.trigger_inference(asset_id)
 
     def on_error(self, ws, error):
         logging.error(f"WebSocket error: {error}")
