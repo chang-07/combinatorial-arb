@@ -122,8 +122,8 @@ class MarketManager:
             )
             try:
                 self.ws_app.run_forever(
-                    ping_interval=10, 
-                    ping_timeout=20, 
+                    ping_interval=30, 
+                    ping_timeout=10, 
                     sslopt={"cert_reqs": ssl.CERT_NONE}
                 )
             except Exception as e:
@@ -177,9 +177,9 @@ class MarketManager:
             if data.get('event_type') == 'book':
                 asset_id = data.get('asset_id')
                 if asset_id in self.order_books:
-                    # Update internal L2 state from [price, size] format
                     self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
                     self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
+                    logging.info(f"CLOB for asset {asset_id} refreshed.")
                     
                     # Trigger Hot Path via debounce
                     now = time.time()
@@ -245,6 +245,7 @@ class MarketManager:
 
     async def update_gas_prices(self):
         while True:
+            logging.info("Refreshing gas prices...")
             try:
                 response = requests.get(POLYGON_GAS_STATION_URL)
                 response.raise_for_status()
