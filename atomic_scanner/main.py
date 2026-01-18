@@ -121,6 +121,11 @@ class MarketManager:
         """Processes a single event without blocking the socket."""
         if data.get('event_type') == 'book':
             asset_id = data.get('asset_id')
+            
+            # --- RESTORED LOGGING ---
+            logging.info(f"CLOB for asset {asset_id} refreshed.")
+            # ------------------------
+
             # Memory update (Fast)
             self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
             self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
