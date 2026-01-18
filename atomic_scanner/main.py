@@ -64,7 +64,7 @@ class MarketManager:
                 on_close=self.on_close
             )
             try:
-                self.ws_app.run_forever()
+                self.ws_app.run_forever(ping_interval=30, ping_timeout=10)
             except Exception as e:
                 logging.error(f"WebSocket run_forever() failed with exception: {e}")
 
@@ -75,68 +75,78 @@ class MarketManager:
             time.sleep(wait_time)
 
     def on_open(self, ws):
-            logging.info("WebSocket connection opened. Fetching all active markets...")
-            market_ids = []
-            next_cursor = ""
-            total_seen = 0
-            
-            while True:
-                try:
-                    # Call API with pagination cursor
-                    response = self.client.get_markets(next_cursor=next_cursor)
-                except Exception as e:
-                    logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
-                    break
+        logging.info("WebSocket connection opened. Fetching all active markets...")
+        self.reconnect_attempts = 0
+        market_ids = []
+        next_cursor = ""
+        total_seen = 0
+        
+        while True:
+            try:
+                # Use next_cursor for pagination; empty string for the first page
+                response = self.client.get_markets(next_cursor=next_cursor)
+            except Exception as e:
+                logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
+                break
 
-                if not response or not response.get('data'):
-                    break
+            if not response or not response.get('data'):
+                break
 
-                markets_in_page = response['data']
-                total_seen += len(markets_in_page)
+            markets_in_page = response['data']
+            total_seen += len(markets_in_page)
 
-                for market in markets_in_page:
-                    # Debug logging for the first market to verify schema
-                    if total_seen == len(markets_in_page):
-                        logging.debug(f"Sample market structure: {json.dumps(market, indent=2)}")
-
-                    # Improved filtering: 
-                    # 1. Must not be closed
-                    # 2. Must have exactly 2 tokens (Binary Market)
-                    is_closed = market.get('closed', False)
-                    tokens = market.get('tokens', [])
-                    
-                    if not is_closed and len(tokens) == 2:
-                        # Check for token IDs using multiple possible keys
-                        token0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
-                        token1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
-                        
-                        if token0_id and token1_id:
-                            market_ids.append(token0_id)
-                            market_ids.append(token1_id)
-                            
-                            # Initialize local state
-                            self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
-                            self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
-
-                # Handle pagination
-                next_cursor = response.get('next_cursor')
-                # If next_cursor is "none" (string) or empty, we have reached the end
-                if not next_cursor or next_cursor.lower() == "none":
-                    break
-            
-                logging.info(f"Scan complete. Processed {total_seen} markets.")
+            for market in markets_in_page:
+                # Improved filtering: 
+                # 1. Must not be closed
+                # 2. Must have exactly 2 tokens (Binary Market)
+                is_closed = market.get('closed', False)
+                tokens = market.get('tokens', [])
                 
-                if not market_ids:
-                    logging.warning("No CLOB-compatible markets found. Check if 'clobTokenId' or 'token_id' exists in API response.")
-                    return
+                if not is_closed and len(tokens) == 2:
+                    # Check for token IDs using multiple possible keys
+                    token0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
+                    token1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
+                    
+                    if token0_id and token1_id:
+                        market_ids.append(token0_id)
+                        market_ids.append(token1_id)
+                        
+                        # Initialize local state
+                        self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
+                        self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
 
-                subscription_message = {
-                    "type": "subscribe",
-                    "channel": "market",
-                    "markets": market_ids,
-                }
-                ws.send(json.dumps(subscription_message))
-                logging.info(f"Subscribed to {len(market_ids)} order books ({len(market_ids)//2} markets).")
+            # Handle pagination
+            next_cursor = response.get('meta', {}).get('next_cursor')
+            if not next_cursor or next_cursor.lower() == "none":
+                break
+        
+        logging.info(f"Scan complete. Processed {total_seen} markets.")
+            
+        if not market_ids:
+            logging.warning("No CLOB-compatible markets found after full scan.")
+            return
+
+        # Batch subscription requests to avoid overwhelming the server
+        unique_market_ids = list(set(market_ids))
+        chunk_size = 500
+        delay_between_batches = 0.1  # 100ms
+
+        total_tokens = len(unique_market_ids)
+        logging.info(f"Preparing to subscribe to {total_tokens} unique tokens...")
+
+        for i in range(0, total_tokens, chunk_size):
+            batch = unique_market_ids[i:i + chunk_size]
+            subscription_message = {
+                "type": "subscribe",
+                "channel": "market",
+                "markets": batch,
+            }
+            ws.send(json.dumps(subscription_message))
+            logging.info(f"Sent subscription for batch {i//chunk_size + 1} ({len(batch)} tokens)...")
+            if total_tokens > chunk_size:
+                time.sleep(delay_between_batches)
+
+        logging.info(f"Finished sending all subscription requests for {total_tokens} tokens across {total_tokens//2} markets.")
 
     def on_message(self, ws, message):
         data = json.loads(message)

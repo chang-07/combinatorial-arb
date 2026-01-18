@@ -1,79 +1,31 @@
-### **Agent Task: Fix Market Discovery with Pagination**
+### **Agent Task: Resolve WebSocket Pipe Breaks & Subscription Overload**
 
-**Objective:**
-Update `atomic_scanner/main.py` to ensure the scanner finds all available CLOB markets. The current implementation only fetches the first page of market data, causing it to miss critical trading opportunities.
+**Objective:** Fix the connectivity issues in `atomic_scanner/main.py` by implementing **Subscription Batching** and **Connection Heartbeats**. The scanner currently fails because it sends too many subscription requests in rapid succession during the market discovery phase.
 
 ---
 
-### **1. Pagination Implementation**
-* **Loop through All Pages:** Refactor the `on_open` method in the `MarketManager` class to use a `while True` loop. 
-* **Correct Parameter Name:** Use `next_cursor` as the keyword argument in `self.client.get_markets(next_cursor=...)`. Do **not** use `cursor`, as it causes an "unexpected keyword argument" error.
-* **Termination Condition:** The loop must break when the API response no longer contains a `next_cursor` or when the `data` list is empty.
+### **1. Move Subscription Logic (The "One-Shot" Fix)**
+* **Problem:** The subscription code is currently inside the pagination loop, causing multiple massive requests to fire.
+* **Fix:** Move the `subscription_message` and `ws.send()` logic in `on_open` to be **after** the `while True` loop. The engine must collect ALL `market_ids` first, then send a single subscription request for the entire set.
 
-### **2. Enhanced Filtering**
-* **Active Market Validation:** Within the loop, ensure markets are only added to the subscription list if:
-    1. `accepting_orders` is `True`.
-    2. `closed` is `False`.
-    3. The market has exactly `2` tokens with valid `clobTokenId` values.
-* **State Initialization:** Properly initialize `self.order_books` for every discovered `token0` and `token1` to prevent `KeyError` during WebSocket updates.
+### **2. Implement Subscription Batching**
+* **Constraint:** Polymarket limits subscriptions to **500 instruments per connection**. 
+* **Logic:** In `on_open`, if `len(market_ids) > 500`, the script must split the IDs into chunks of 500 and send them with a small delay (e.g., 0.1s) between each `ws.send()` to avoid triggering rate-limiters.
 
-### **3. Anonymous WebSocket Integrity**
-* **Maintain Public Mode:** Ensure the `on_open` method still sends the standard public subscription message: `{"type": "subscribe", "channel": "market", "markets": [market_ids]}`.
-* **Logging:** Add a log statement indicating how many total markets were found and subscribed to after the full pagination scan completes.
+### **3. Add Connection Heartbeats (Pings)**
+* **Problem:** Anonymous connections are often dropped by the server or intermediate proxies if no data is sent for 30–60 seconds.
+* **Fix:** Update the `run_forever()` call in `run_websocket` to include heartbeats:
+    ```python
+    self.ws_app.run_forever(ping_interval=30, ping_timeout=10)
+    ```
+
+### **4. Error Handling & Reconnection**
+* **Graceful Close:** Update `on_close` to log the specific error code. If a `1006` (Abnormal Closure) is detected, ensure the exponential backoff logic is properly triggered.
+* **Filter Refinement:** To reduce the initial load, prioritize markets with the highest volume or activity first to stay well under the 500-instrument limit per pipe.
 
 ---
 
 **Success Criteria:**
-1. The scanner successfully retrieves multiple pages of markets from the Polymarket API.
-2. The error regarding the `cursor` argument is resolved by using `next_cursor`.
-3. The scanner logs a high volume of subscriptions (e.g., "Subscribed to 400+ order books") instead of zero or a single page's worth.
-
-# Example on_open(self,ws):
-def on_open(self, ws):
-        logging.info("WebSocket connection opened. Fetching all active markets...")
-        market_ids = []
-        next_cursor = ""
-        
-        while True:
-            try:
-                # Use next_cursor for pagination; empty string for the first page
-                response = self.client.get_markets(next_cursor=next_cursor)
-            except Exception as e:
-                logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
-                break
-
-            if not response or not response.get('data'):
-                break
-
-            for market in response['data']:
-                # Filter for active, non-closed markets with exactly 2 tokens
-                if (market.get('accepting_orders') and 
-                    not market.get('closed') and 
-                    len(market.get('tokens', [])) == 2):
-                    
-                    token0_id = market['tokens'][0]['clobTokenId']
-                    token1_id = market['tokens'][1]['clobTokenId']
-                    
-                    if token0_id and token1_id:
-                        market_ids.append(token0_id)
-                        market_ids.append(token1_id)
-                        # Initialize local order book state
-                        self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
-                        self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
-
-            # Check if there is another page
-            next_cursor = response.get('next_cursor')
-            if not next_cursor:
-                break
-        
-        if not market_ids:
-            logging.warning("No CLOB-compatible markets found after full scan.")
-            return
-
-        subscription_message = {
-            "type": "subscribe",
-            "channel": "market",
-            "markets": market_ids,
-        }
-        ws.send(json.dumps(subscription_message))
-        logging.info(f"Subscribed to {len(market_ids)} order books across {len(market_ids)//2} markets.")
+1. The scanner completes the 10,000+ market scan without the WebSocket closing.
+2. Only one set of batched subscription messages is sent to the server.
+3. The connection remains stable for 10+ minutes with active "ping/pong" logs.
