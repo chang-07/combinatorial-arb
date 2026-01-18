@@ -1,0 +1,11 @@
+# Ignore virtual environments
+/venv/
+/atomic_scanner/venv/
+
+# Ignore python cache
+__pycache__/
+*.pyc
+
+# Ignore environment variables file
+.env
+atomic_scanner/.env

@@ -9,6 +9,10 @@ import websocket
 import threading
 from py_clob_client.client import ClobClient
 from inference_core import InferenceCore
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -18,8 +22,6 @@ HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137  # Polygon Mainnet
 WEBSOCKET_URL = "wss://ws-subscriptions-clob.polymarket.com"
 POLYGON_GAS_STATION_URL = "https://gasstation.polygon.technology/v2"
-COINMARKETCAP_API_KEY = os.environ.get("COINMARKETCAP_API_KEY")
-COINMARKETCAP_URL = "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
 API_KEY = os.environ.get("POLYMARKET_API_KEY")
 API_SECRET = os.environ.get("POLYMARKET_API_SECRET")
 API_PASSPHRASE = os.environ.get("POLYMARKET_API_PASSPHRASE")
@@ -48,7 +50,7 @@ class MarketManager:
         if not API_KEY or not API_SECRET or not API_PASSPHRASE:
             logging.warning("Polymarket API keys not found. Running in Read-Only/Public Mode.")
         
-        furl = WEBSOCKET_URL + "/ws"
+        furl = WEBSOCKET_URL + "/ws/market"
         self.ws_app = websocket.WebSocketApp(
             furl,
             on_open=self.on_open,
@@ -176,17 +178,16 @@ class MarketManager:
             await asyncio.sleep(60)
 
     def get_matic_price_usd(self):
-        if not COINMARKETCAP_API_KEY:
-            return None
-        headers = {'Accepts': 'application/json', 'X-CMC_PRO_API_KEY': COINMARKETCAP_API_KEY}
-        params = {'symbol': 'MATIC', 'convert': 'USD'}
+        """Fetches MATIC price from Coinbase."""
+        url = "https://api.coinbase.com/v2/prices/MATIC-USD/spot"
         try:
-            response = requests.get(COINMARKETCAP_URL, headers=headers, params=params)
+            response = requests.get(url)
             response.raise_for_status()
             data = response.json()
-            return Decimal(data['data']['MATIC']['quote']['USD']['price'])
+            logging.info(f"Coinbase API Response: {json.dumps(data, indent=2)}")
+            return Decimal(data['data']['amount'])
         except (requests.exceptions.RequestException, KeyError, InvalidOperation) as e:
-            logging.error(f"Failed to fetch MATIC price: {e}")
+            logging.error(f"Failed to fetch MATIC price from Coinbase: {e}")
             return None
 
 def log_opportunity(opportunity_data):

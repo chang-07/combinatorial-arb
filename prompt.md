@@ -1,38 +1,32 @@
-### Phase 1 Detail: Finalizing the Atomic Scanner
+### **Agent Task: Transition to Anonymous Real-Time Monitoring**
 
-To complete Phase 1, the scanner must transition from a proof-of-concept poller to a real-time detection system that accounts for live network congestion and order book depth.
+**Objective:**
+Refactor the `atomic_scanner/main.py` script to support **Anonymous (Unauthenticated) WebSocket Monitoring** for Phase 1. The current implementation fails because it attempts an authenticated handshake with missing L2 API credentials (API Secret and Passphrase). Since public market data and order book updates do not require authentication on Polymarket, the engine must be adjusted to run in public mode.
 
-#### 1.1 Live Data Ingestion (WebSocket Integration)
-* **Goal:** Reduce "Detection Latency" by replacing HTTP polling with a persistent WebSocket connection.
-* **Implementation:**
-    * Subscribe to the `market` channel via the CLOB WebSocket (`wss://clob.polymarket.com/ws/market`).
-    * Use an asynchronous event loop (`asyncio`) to maintain a local, incremental copy of the L2 order book.
-    * Implement a "Debounce" mechanism to prevent the Inference Core from triggering on every minor 0.0001 price tick, focusing instead on significant liquidity shifts.
+---
 
-#### 1.2 Realistic Profitability (WAP Slippage & Depth)
-* **Goal:** Calculate profit based on "Fillable Liquidity" rather than just the Best Bid/Offer (BBO).
-* **Target Size:** Standardize all calculations on a **500 USDC** trade size.
-* **Weighted Average Price (WAP) Formula:**
-    * `Effective_Price = Σ(price_i * size_i) / Target_Size`.
-    * The engine must traverse the `asks` array level-by-level until the `cumulative_size` meets the `Target_Size`.
-    * If the book lacks sufficient depth for the 500 USDC target, the opportunity is discarded as "untradable."
+### **1. WebSocket Refactoring (Anonymous Mode)**
+* **Remove Auth Handshake:** Modify the `run_websocket` method in the `MarketManager` class to remove the `auth_payload` and the `Authorization` header from the `websocket.WebSocketApp` initialization.
+* **Connection Logic:** Ensure the connection to `WEBSOCKET_URL` is established without any security tokens.
+* **Public Subscription:** The `on_open` method must continue to send a subscription message to the `market` channel using the correct format for public streams: `{"type": "subscribe", "channel": "market", "markets": [market_ids]}`.
 
-#### 1.3 Real-time Friction Accounting (Gas & Fees)
-* **Goal:** Dynamically calculate "Net Profit" by ingesting live Polygon network costs.
-* **Implementation:**
-    * Periodically poll the Polygon Gas Station (every 60s) for `maxPriorityFee` and `estimatedBaseFee`.
-    * **Transaction Estimate:** Calculate cost based on ~200,000 gas units for two `createOrder` calls.
-    * **Net Profit Formula:** `(1.0 - (WAP_Yes + WAP_No)) * Target_Size - (Total_Gas_USD + Exchange_Fees)`.
+### **2. Environment Variable & Configuration Updates**
+* **Optional Credentials:** Update the script to make `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, and `POLYMARKET_API_PASSPHRASE` optional.
+* **Graceful Warnings:** If these keys are missing, the script should log a `WARNING` stating that it is running in "Read-Only/Public Mode" rather than terminating the process.
+* **Maintain CoinMarketCap:** Keep `COINMARKETCAP_API_KEY` as a **mandatory** requirement. This is still necessary to fetch MATIC/USD prices for the real-time friction accounting required by Phase 1.3.
 
-#### 1.4 "Hot Path" Decoupling (C++ Prep)
-* **Goal:** Isolate the calculation logic for a future C++ port.
-* **InferenceCore Class:**
-    * A standalone Python class that is **entirely I/O free** (no `print`, no `requests`, no `logging`).
-    * **Function:** `calculate_net_profit(target_size, book_yes, book_no, gas_usd)`.
-    * This separation ensures the math can be ported to C++ with zero structural changes once verified in Python.
+### **3. Logic Preservation ("Hot Path" Integrity)**
+* **InferenceCore Protection:** Do **not** modify the `inference_core.py` file or the `InferenceCore` class.
+* **WAP Continuity:** Ensure the Weighted Average Price (WAP) calculation for the **500 USDC Target Size** remains the primary filter for trade viability.
+* **Debounce & Performance:** Retain the `0.5s` debounce period and the `MarketManager`'s local state management to prevent CPU bottlenecking during high-frequency updates.
 
-#### 1.5 Structured Opportunity Logging
-* **Goal:** Build a dataset for Phase 2 "Probabilistic Forest" clustering.
-* **Implementation:**
-    * Append all opportunities with a `gross_profit > 0` to `missed_opportunities.json`.
-    * Metadata must include: `timestamp`, `market_id`, `wap_yes`, `wap_no`, `gas_price_gwei`, and `total_cost_usd`.
+### **4. Execution Logging for Phase 2**
+* **Persistence:** Ensure all opportunities where `gross_profit > 0` are appended to `missed_opportunities.json`.
+* **Data Schema:** Each log entry must include the `timestamp`, `market_question`, `wap_yes`, `wap_no`, `gas_price_gwei`, and `total_cost_usd`. This dataset is critical for the upcoming **Phase 2: Spectral Clustering and Graph Laplacian** implementation.
+
+---
+
+**Success Criteria:**
+1. The script connects to the Polymarket WebSocket without an `Authorization` error.
+2. It successfully logs "Subscribed to [X] order books" and starts receiving market updates.
+3. The `update_gas_prices` loop continues to run in the background every 60 seconds to provide the `total_gas_cost_usd` for the inference engine.
