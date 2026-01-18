@@ -2,3 +2,5 @@ py-clob-client
 requests
 websocket-client
 python-dotenv
+aiofiles
+websockets
