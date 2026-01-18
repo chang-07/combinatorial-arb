@@ -47,15 +47,52 @@ class MarketManager:
         self.market_ids_to_subscribe = []
         self.gas_refreshes = 0
 
-    async def log_worker(self):
-        """Background worker to handle all disk writes."""
-        while True:
-            file_path, data = await self.log_queue.get()
-            async with aiofiles.open(file_path, mode='a') as f:
-                await f.write(json.dumps(data) + '\n')
-            self.log_queue.task_done()
-
     def discover_markets(self):
+        """
+        Replaces CLOB pagination with Gamma API discovery to find active tokens.
+        Fixes the '0 event matches' and '400 Bad Request' cursor errors.
+        """
+        logging.info("Starting market discovery via Gamma API...")
+        
+        # Gamma API allows filtering for active/open markets directly
+        # 'closed=false' ensures we only get currently trading markets
+        url = "https://gamma-api.polymarket.com/events?active=true&closed=false&limit=100"
+        
+        try:
+            response = requests.get(url)
+            response.raise_for_status()
+            events = response.json()
+            
+            discovered_tokens = []
+            for event in events:
+                # Each event contains a 'markets' list with the actual tradable instruments
+                for market in event.get('markets', []):
+                    ids_str = market.get('clobTokenIds')
+                    if ids_str:
+                        # clobTokenIds is returned as a stringified list by Gamma API
+                        try:
+                            token_ids = json.loads(ids_str)
+                            if isinstance(token_ids, list) and len(token_ids) == 2:
+                                discovered_tokens.extend(token_ids)
+                                t0_id = token_ids[0]
+                                t1_id = token_ids[1]
+                                self.order_books[t0_id] = {"bids": [], "asks": [], "other_side": t1_id, "is_yes": True, "question": event.get("question")}
+                                self.order_books[t1_id] = {"bids": [], "asks": [], "other_side": t0_id, "is_yes": False, "question": event.get("question")}
+                        except (json.JSONDecodeError, TypeError) as e:
+                            logging.debug(f"Failed to parse token IDs: {ids_str}")
+                            continue
+            
+            # Deduplicate the list to avoid redundant WebSocket subscriptions
+            self.market_ids_to_subscribe = list(set(discovered_tokens))
+            logging.info(f"Discovery complete. Found {len(self.market_ids_to_subscribe)} active tokens.")
+            
+            if not self.market_ids_to_subscribe:
+                logging.warning("No active markets found. Verify your IP is not geo-blocked.")
+                
+        except Exception as e:
+            logging.error(f"Discovery failed: {e}")
+
+    def start(self):
         """
         Replaces CLOB pagination with Gamma API discovery to find active tokens.
         Fixes the '0 event matches' and '400 Bad Request' cursor errors.
@@ -126,15 +163,34 @@ class MarketManager:
             logging.info(f"CLOB for asset {asset_id} refreshed.")
             # ------------------------
 
-            # Memory update (Fast)
-            self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
-            self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
-            
-            # Queue for logging (Fast)
-            await self.log_queue.put((EVENTS_LOG_FILE, {"timestamp": time.time(), "asset_id": asset_id}))
-            
-            # Trigger math in task (Non-blocking)
-            asyncio.create_task(self.trigger_inference_async(asset_id))
+        for data in events:
+            if data.get('event_type') == 'book':
+                asset_id = data.get('asset_id')
+                if asset_id in self.order_books:
+                    self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
+                    self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
+                    logging.info(f"CLOB for asset {asset_id} refreshed.")
+                    
+                    # NEW: Log every refresh event for spectral embedding
+                    log_event({
+                        "timestamp": time.time(),
+                        "asset_id": asset_id,
+                        "question": self.order_books[asset_id]['question'],
+                        "best_bid": data.get('buys')[0][0] if data.get('buys') else None,
+                        "best_ask": data.get('sells')[0][0] if data.get('sells') else None
+                    })
+
+                    # Trigger Hot Path via debounce
+                    now = time.time()
+                    if now - self.last_update_times.get(asset_id, 0) > self.debounce_period:
+                        self.last_update_times[asset_id] = now
+                        self.trigger_inference(asset_id)
+
+    def on_error(self, ws, error):
+        logging.error(f"WebSocket error: {error}")
+
+    def on_close(self, ws, close_status_code, close_msg):
+        logging.info(f"WebSocket connection closed: {close_status_code} - {close_msg}")
 
     async def trigger_inference_async(self, market_id):
         if not self.total_gas_cost_usd:
@@ -223,6 +279,22 @@ class MarketManager:
         except (requests.exceptions.RequestException, KeyError, InvalidOperation) as e:
             logging.error(f"Failed to fetch MATIC price from Coinbase: {e}")
             return None
+
+def log_opportunity(opportunity_data):
+    """Logs a profitable opportunity to a JSON file."""
+    try:
+        with open(OPPORTUNITIES_LOG_FILE, 'a') as f:
+            f.write(json.dumps(opportunity_data) + '\n')
+    except IOError as e:
+        logging.error(f"Error writing to opportunities log: {e}")
+
+def log_event(event_data):
+    """Logs every order book refresh for Phase 2 correlation analysis."""
+    try:
+        with open(EVENTS_LOG_FILE, 'a') as f:
+            f.write(json.dumps(event_data) + '\n')
+    except IOError as e:
+        logging.error(f"Event logging error: {e}")
 
 async def main():
     logging.info("Starting atomic scanner...")
