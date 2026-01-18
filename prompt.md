@@ -1,59 +1,48 @@
-### **Agent Task: Implement Heuristic Pruning & Market Caching**
+### **Agent Task: Implement Full Event Logging for Spectral Clustering Analysis**
 
 **Objective:**
-Refactor `atomic_scanner/main.py` to implement **Heuristic Pruning** and **Market Caching**. This will reduce the WebSocket subscription load from 52,000+ tokens to a high-velocity subset based on 24h volume, while eliminating redundant discovery scans upon reconnection.
+Refactor `atomic_scanner/main.py` to implement **Full Event Logging**. While the scanner currently logs "Net Profitable" opportunities, Phase 2 (Spectral Clustering) requires a dataset of all market refreshes to identify "Logical Neighborhoods"—markets that move together even when they aren't profitable.
 
 ---
 
-### **1. Volume-Based Heuristic Pruning**
-* **The Problem**: Monitoring the entire "firehose" of 52,000+ tokens causes significant processing lag and "slow activity" logs during low-volatility periods.
-* **The Fix**: Filter markets during `discover_markets` using the `volume_24h` field.
-* **Critical Logic**:
-    * Define a `MIN_VOLUME_THRESHOLD = Decimal('1000.0')`.
-    * Only add tokens to `self.market_ids_to_subscribe` if `Decimal(str(market.get('volume_24h', 0))) >= MIN_VOLUME_THRESHOLD`.
+### **1. Define Event Logging Infrastructure**
+* **The Problem:** The current logging is restricted to `missed_opportunities.json` and only triggers when `gross_profit > 0`. This is insufficient for building the **Adjacency Matrix ($A$)** needed for the **Graph Laplacian**, as that requires data on temporal correlations between all market updates.
+* **The Fix:** Create a secondary, append-only log file for all valid order book refreshes.
 
-### **2. Implement Discovery Caching**
-* **The Problem**: The scanner performs a full ~344,000 market scan every time the WebSocket connection resets, leading to minutes of downtime.
-* **The Fix**: Save the `market_ids_to_subscribe` and `order_books` state to a local JSON file (`market_cache.json`) and load it on startup if the cache is < 1 hour old.
+### **2. Implement `log_event` Logic**
+* **Log File:** `market_events.json`.
+* **Placement:** The logging must occur inside `on_message` immediately after a valid `book` event is parsed but **before** the debounce check. This ensures we capture the high-resolution frequency of updates.
+* **Schema Requirements:**
+    * `timestamp`: Precise epoch time of the update.
+    * `asset_id`: The ID of the token being refreshed.
+    * `market_question`: The semantic name of the market.
+    * `best_bid`: The top-of-book bid price.
+    * `best_ask`: The top-of-book ask price.
 
----
-
-### **3. Implementation Details for `discover_markets`**
+### **3. Critical Code Adjustment (Example for `main.py`)**
 
 ```python
-# Constants to be added to Configuration section
-MIN_VOLUME_THRESHOLD = Decimal('1000.0')
-CACHE_FILE = "market_cache.json"
-CACHE_TTL = 3600  # 1 hour
+# In Configuration section
+EVENTS_LOG_FILE = "market_events.json"
 
-def discover_markets(self):
-    """
-    Paginates with volume-based pruning and cache checks.
-    """
-    # 1. Check for valid cache
-    if os.path.exists(CACHE_FILE):
-        if time.time() - os.path.getmtime(CACHE_FILE) < CACHE_TTL:
-            with open(CACHE_FILE, 'r') as f:
-                cache = json.load(f)
-                self.market_ids_to_subscribe = cache['ids']
-                self.order_books = cache['books']
-                logging.info(f"Loaded {len(self.market_ids_to_subscribe)} tokens from cache.")
-                return
+def log_event(event_data):
+    """Logs every order book refresh for Phase 2 correlation analysis."""
+    try:
+        with open(EVENTS_LOG_FILE, 'a') as f:
+            f.write(json.dumps(event_data) + '\n')
+    except IOError as e:
+        logging.error(f"Event logging error: {e}")
 
-    logging.info("Starting fresh market discovery with volume pruning...")
-    next_cursor = ""
-    # ... (existing pagination loop logic)
-
-    # Inside the loop, replace current filtering with:
-    volume_24h = Decimal(str(market.get('volume_24h', 0)))
-    if not is_closed and len(tokens) == 2 and volume_24h >= MIN_VOLUME_THRESHOLD:
-        # (Add to subscribe list and link order_books as currently implemented)
-
-    # 2. After loop finishes, save to cache
-    cache_data = {
-        "ids": self.market_ids_to_subscribe,
-        "books": self.order_books
-    }
-    with open(CACHE_FILE, 'w') as f:
-        json.dump(cache_data, f)
-    logging.info(f"Discovery complete. Cached {len(self.market_ids_to_subscribe)} active tokens.")
+# Inside on_message for event_type == 'book'
+asset_id = data.get('asset_id')
+if asset_id in self.order_books:
+    # ... existing update logic ...
+    
+    # NEW: Log every refresh event for spectral embedding
+    log_event({
+        "timestamp": time.time(),
+        "asset_id": asset_id,
+        "question": self.order_books[asset_id]['question'],
+        "best_bid": data.get('buys')[0][0] if data.get('buys') else None,
+        "best_ask": data.get('sells')[0][0] if data.get('sells') else None
+    })

@@ -27,6 +27,7 @@ API_KEY = os.environ.get("POLYMARKET_API_KEY")
 API_SECRET = os.environ.get("POLYMARKET_API_SECRET")
 API_PASSPHRASE = os.environ.get("POLYMARKET_API_PASSPHRASE")
 OPPORTUNITIES_LOG_FILE = "missed_opportunities.json"
+EVENTS_LOG_FILE = "market_events.json"
 TARGET_SIZE_USD = Decimal('500.0')
 EXCHANGE_FEE_PERCENT = Decimal('0.001')  # 0.1%
 MIN_VOLUME_THRESHOLD = Decimal('1000.0')
@@ -201,8 +202,16 @@ class MarketManager:
                 if asset_id in self.order_books:
                     self.order_books[asset_id]['asks'] = [{"price": x[0], "size": x[1]} for x in data.get('sells', [])]
                     self.order_books[asset_id]['bids'] = [{"price": x[0], "size": x[1]} for x in data.get('buys', [])]
-                    logging.info(f"CLOB for asset {asset_id} refreshed.")
                     
+                    # NEW: Log every refresh event for spectral embedding
+                    log_event({
+                        "timestamp": time.time(),
+                        "asset_id": asset_id,
+                        "question": self.order_books[asset_id]['question'],
+                        "best_bid": data.get('buys')[0][0] if data.get('buys') else None,
+                        "best_ask": data.get('sells')[0][0] if data.get('sells') else None
+                    })
+
                     # Trigger Hot Path via debounce
                     now = time.time()
                     if now - self.last_update_times.get(asset_id, 0) > self.debounce_period:
@@ -310,6 +319,14 @@ def log_opportunity(opportunity_data):
             f.write(json.dumps(opportunity_data) + '\n')
     except IOError as e:
         logging.error(f"Error writing to opportunities log: {e}")
+
+def log_event(event_data):
+    """Logs every order book refresh for Phase 2 correlation analysis."""
+    try:
+        with open(EVENTS_LOG_FILE, 'a') as f:
+            f.write(json.dumps(event_data) + '\n')
+    except IOError as e:
+        logging.error(f"Event logging error: {e}")
 
 async def main():
     logging.info("Starting atomic scanner...")
