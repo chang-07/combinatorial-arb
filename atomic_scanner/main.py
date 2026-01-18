@@ -74,62 +74,69 @@ class MarketManager:
             logging.info(f"WebSocket connection lost. Attempting to reconnect in {wait_time} seconds...")
             time.sleep(wait_time)
 
-
-
     def on_open(self, ws):
-        logging.info("WebSocket connection opened. Fetching all active markets...")
-        self.reconnect_attempts = 0
-        market_ids = []
-        next_cursor = ""  # Start with an empty cursor for the first page
-        
-        while True:
-            try:
-                # Use next_cursor for pagination
-                response = self.client.get_markets(next_cursor=next_cursor)
-            except Exception as e:
-                logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
-                break
+            logging.info("WebSocket connection opened. Fetching all active markets...")
+            market_ids = []
+            next_cursor = ""
+            total_seen = 0
+            
+            while True:
+                try:
+                    # Call API with pagination cursor
+                    response = self.client.get_markets(next_cursor=next_cursor)
+                except Exception as e:
+                    logging.error(f"Failed to fetch markets at cursor '{next_cursor}': {e}")
+                    break
 
-            if not response or not response.get('data'):
-                logging.info("No market data in response.")
-                break
+                if not response or not response.get('data'):
+                    break
 
-            for market in response['data']:
-                # Filter for active, non-closed markets with exactly 2 tokens
-                if (market.get('accepting_orders') and 
-                    not market.get('closed') and 
-                    len(market.get('tokens', [])) == 2):
+                markets_in_page = response['data']
+                total_seen += len(markets_in_page)
+
+                for market in markets_in_page:
+                    # Debug logging for the first market to verify schema
+                    if total_seen == len(markets_in_page):
+                        logging.debug(f"Sample market structure: {json.dumps(market, indent=2)}")
+
+                    # Improved filtering: 
+                    # 1. Must not be closed
+                    # 2. Must have exactly 2 tokens (Binary Market)
+                    is_closed = market.get('closed', False)
+                    tokens = market.get('tokens', [])
                     
-                    token0 = market.get('tokens', [{}])[0]
-                    token1 = market.get('tokens', [{}])[1]
+                    if not is_closed and len(tokens) == 2:
+                        # Check for token IDs using multiple possible keys
+                        token0_id = tokens[0].get('clobTokenId') or tokens[0].get('token_id')
+                        token1_id = tokens[1].get('clobTokenId') or tokens[1].get('token_id')
+                        
+                        if token0_id and token1_id:
+                            market_ids.append(token0_id)
+                            market_ids.append(token1_id)
+                            
+                            # Initialize local state
+                            self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
+                            self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
 
-                    token0_id = token0.get('clobTokenId')
-                    token1_id = token1.get('clobTokenId')
-                    
-                    if token0_id and token1_id:
-                        market_ids.append(token0_id)
-                        market_ids.append(token1_id)
-                        # Initialize local order book state
-                        self.order_books[token0_id] = {"bids": [], "asks": [], "market_info": market}
-                        self.order_books[token1_id] = {"bids": [], "asks": [], "market_info": market}
+                # Handle pagination
+                next_cursor = response.get('next_cursor')
+                # If next_cursor is "none" (string) or empty, we have reached the end
+                if not next_cursor or next_cursor.lower() == "none":
+                    break
+            
+                logging.info(f"Scan complete. Processed {total_seen} markets.")
+                
+                if not market_ids:
+                    logging.warning("No CLOB-compatible markets found. Check if 'clobTokenId' or 'token_id' exists in API response.")
+                    return
 
-            # Check if there is another page
-            next_cursor = response.get('meta', {}).get('next_cursor')
-            if not next_cursor:
-                logging.info("Finished fetching all market pages.")
-                break
-        
-        if not market_ids:
-            logging.warning("No CLOB-compatible markets found after full scan.")
-            return
-
-        subscription_message = {
-            "type": "subscribe",
-            "channel": "market",
-            "markets": list(set(market_ids)), # Use set to ensure unique token IDs
-        }
-        ws.send(json.dumps(subscription_message))
-        logging.info(f"Subscribed to {len(set(market_ids))} order books across {len(set(market_ids))//2} markets.")
+                subscription_message = {
+                    "type": "subscribe",
+                    "channel": "market",
+                    "markets": market_ids,
+                }
+                ws.send(json.dumps(subscription_message))
+                logging.info(f"Subscribed to {len(market_ids)} order books ({len(market_ids)//2} markets).")
 
     def on_message(self, ws, message):
         data = json.loads(message)
