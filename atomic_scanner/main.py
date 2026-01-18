@@ -45,11 +45,8 @@ class MarketManager:
         self.ws_thread.start()
 
     def run_websocket(self):
-        auth_payload = {
-            "key": API_KEY,
-            "secret": API_SECRET,
-            "passphrase": API_PASSPHRASE,
-        }
+        if not API_KEY or not API_SECRET or not API_PASSPHRASE:
+            logging.warning("Polymarket API keys not found. Running in Read-Only/Public Mode.")
         
         furl = WEBSOCKET_URL + "/ws"
         self.ws_app = websocket.WebSocketApp(
@@ -57,8 +54,7 @@ class MarketManager:
             on_open=self.on_open,
             on_message=self.on_message,
             on_error=self.on_error,
-            on_close=self.on_close,
-            header={"Authorization": f"Bearer {json.dumps(auth_payload)}"}
+            on_close=self.on_close
         )
         self.ws_app.run_forever()
 
